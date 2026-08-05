@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=82.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iot-vuln-agent"
+version = "0.1.0"
+description = "IoT 固件漏洞挖掘 — IDA Pro (MCP/idalib) + QEMU VM 自动化分析管线"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+
+dependencies = [
+    "mcp>=1.28",
+    "httpx>=0.28",
+    "paramiko>=5.0",
+    "pydantic>=2.13",
+    "pydantic-settings>=2.14",
+    "structlog>=26.0",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

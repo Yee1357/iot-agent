@@ -1,0 +1,604 @@
+"""IDA binary analysis — scanner + analysis helpers.
+
+Provides IDAHeadlessScanner (primary, runs on headless IDA) and
+IDASystematicScanner (optional, runs on MCP). Both produce
+VulnerabilityFinding lists for AI consumption.
+
+Analysis helpers (extract_sink_context, is_hardcoded_arg, etc.) are
+pure Python functions that operate on decompiled pseudocode strings.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+import structlog
+
+from iot_agent.tools.ida_mcp import (
+    IDAHeadlessClient,
+    IDAMCPClient,
+    VulnerabilityFinding,
+)
+
+logger = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+DANGEROUS_SINKS = [
+    "strcpy", "sprintf", "strcat", "gets",
+    "memcpy", "read", "recv", "fread",
+    "system", "popen", "execve", "execl", "execlp",
+    "printf", "fprintf", "vsprintf", "snprintf",
+    # IoT firmware wrappers — often the real sink behind system()
+    "lxmldbc_system",
+    "xmldbc_ephp", "xmldbc_ephp_wb",
+]
+
+TAINT_SOURCES = [
+    "getenv", "recv", "read", "fread", "fgets",
+    "cgibin_parse_request", "sobj_get_string",
+    "sub_40A1C0", "sub_405550",  # D-Link CGI parameter getters
+]
+
+# sink -> (CWE, description, severity, confidence)
+_SINK_CLASSIFICATION: dict[str, tuple[str, str, str, float]] = {
+    "system":   ("CWE-78", "command injection",  "HIGH", 0.6),
+    "popen":    ("CWE-78", "command injection",  "HIGH", 0.6),
+    "execve":   ("CWE-78", "command injection",  "HIGH", 0.6),
+    "execl":    ("CWE-78", "command injection",  "HIGH", 0.6),
+    "execlp":   ("CWE-78", "command injection",  "HIGH", 0.6),
+    "lxmldbc_system": ("CWE-78", "command injection (xmldbc wrapper)", "HIGH", 0.7),
+    "xmldbc_ephp":    ("CWE-78", "PHP code injection",  "HIGH", 0.6),
+    "xmldbc_ephp_wb": ("CWE-78", "PHP code injection",  "HIGH", 0.6),
+    "sprintf":  ("CWE-121", "buffer overflow",   "HIGH", 0.5),
+    "vsprintf": ("CWE-121", "buffer overflow",   "HIGH", 0.5),
+    "strcpy":   ("CWE-120", "buffer overflow risk", "HIGH", 0.4),
+    "strcat":   ("CWE-120", "buffer overflow risk", "HIGH", 0.4),
+    "gets":     ("CWE-120", "buffer overflow risk", "HIGH", 0.4),
+}
+_SINK_DEFAULT = ("CWE-20", "", "MEDIUM", 0.2)
+
+
+# ---------------------------------------------------------------------------
+# Analysis helpers (pure Python, no IDA dependency)
+# ---------------------------------------------------------------------------
+
+
+def extract_sink_context(code: str, sink_name: str, context_lines: int = 8) -> str:
+    """Extract lines around a sink call from decompiled pseudocode.
+
+    Returns only the surrounding context (default ±8 lines), not the
+    entire function. This is for AI quick triage — not final analysis.
+    """
+    lines = code.splitlines()
+    # Find lines that contain the sink call: sink_name(
+    pattern = re.compile(r'\b' + re.escape(sink_name) + r'\s*\(')
+    hits = [i for i, line in enumerate(lines) if pattern.search(line)]
+
+    if not hits:
+        return ""
+
+    # Take the first hit and extract surrounding lines
+    hit = hits[0]
+    start = max(0, hit - context_lines)
+    end = min(len(lines), hit + context_lines + 1)
+
+    snippet = lines[start:end]
+    # Add line markers so AI knows where the sink is
+    result = []
+    for i, line in enumerate(snippet):
+        lineno = start + i
+        marker = "  ← SINK" if lineno == hit else ""
+        result.append(f"  {lineno:4d} | {line}{marker}")
+    return "\n".join(result)
+
+
+# Format-string sinks: the dangerous arg is NOT the format string (1st arg),
+# but the variadic args that get interpolated.  A format string containing
+# %s / %n / %x means external data flows in → must NOT be treated as safe.
+_FORMAT_STRING_SINKS = {"sprintf", "vsprintf", "snprintf", "fprintf",
+                        "printf", "syslog", "lxmldbc_system"}
+
+
+def is_hardcoded_arg(code: str, sink_name: str) -> bool:
+    """Check if a sink's argument is a hardcoded string constant.
+
+    system("reboot")  -> True  (safe, can exclude)
+    system(cmd_buf)   -> False (needs further analysis)
+    sprintf(buf, "svc %s", input) -> False (format string has %s)
+    sprintf(buf, "Content-Type: text/html") -> True (no placeholders)
+    """
+    # Find the sink call line — match the outermost call only
+    pattern = re.compile(r'\b' + re.escape(sink_name) + r'\s*\((.+)')
+    for line in code.splitlines():
+        m = pattern.search(line)
+        if not m:
+            continue
+        arg_part = m.group(1).strip()
+
+        # --- Format-string sinks (sprintf / lxmldbc_system / …) ----------
+        # The format string may be arg[0] (lxmldbc_system) or arg[1]
+        # (sprintf) or arg[2] (snprintf).  We find the first string
+        # literal in the arg list and treat that as the format string.
+        if sink_name in _FORMAT_STRING_SINKS:
+            # Find all string-literal positions in the full arg text
+            all_strs = list(re.finditer(r'"([^"]*)"', arg_part))
+            if not all_strs:
+                return False  # no literal at all → not hardcoded
+            # Pick the format string: for lxmldbc_system it's the 1st;
+            # for sprintf/vsprintf it's the 2nd; for snprintf/fprintf 3rd.
+            fmt_pos = 0
+            if sink_name in ("sprintf", "vsprintf"):
+                fmt_pos = min(1, len(all_strs) - 1)
+            elif sink_name in ("snprintf", "fprintf"):
+                fmt_pos = min(2, len(all_strs) - 1)
+            fmt_match = all_strs[fmt_pos]
+            fmt_body = fmt_match.group(1)
+            # Has %s / %d / %x / %n … → external data can flow in
+            if re.search(r'%[sdixn]', fmt_body):
+                return False
+            # No placeholders AND no extra non-literal arguments after
+            # the format string → truly hardcoded
+            rest = arg_part[fmt_match.end():].strip()
+            if rest == '' or rest.startswith(')'):
+                return True
+            # There are more args after the format string → they may be
+            # user-controlled even if the format has no placeholders
+            # (e.g. snprintf(buf, sz, msg, user_val))
+            extra = rest.lstrip(',').strip()
+            if extra.startswith('"') or extra.startswith(')') or extra == '':
+                return True
+            return False
+
+        # --- Single-arg sinks (system / popen) ---------------------------
+        if arg_part.startswith('"'):
+            first_str = re.match(r'"([^"]*)"', arg_part)
+            if first_str:
+                rest = arg_part[first_str.end():].strip()
+                # system("reboot") or popen("cmd", "r") — first arg is literal
+                if rest.startswith(')') or rest == '' or rest.startswith(', "'):
+                    return True
+            return False
+        if arg_part.startswith("'") and arg_part[2:3] == "'":
+            return True
+
+        # --- Two-arg sinks (strcpy / strcat / strncpy / memcpy) ----------
+        # The dangerous arg is the *source* (2nd arg), not the dest (1st).
+        # strcpy(dest, "literal") → safe;  strcpy(dest, var) → not safe.
+        if sink_name in ("strcpy", "strcat", "strncpy", "memcpy"):
+            parts = [a.strip() for a in arg_part.split(",")]
+            if len(parts) >= 2:
+                src = parts[1].strip()
+                if src.startswith('"'):
+                    return True  # source is a string literal
+            return False
+
+    # Pattern didn't match any line → can't determine, treat as not hardcoded
+    return False
+
+
+def trace_arg_source(code: str, sink_name: str) -> dict[str, Any]:
+    """Trace the source of a sink's argument (1-2 hop def-use chain).
+
+    Returns:
+        {
+            "arg": "cmd_buf",           # direct argument name
+            "source": "getenv",         # source function (if found)
+            "source_detail": "QUERY_STRING",
+            "is_tainted": True,         # from known taint source?
+            "trace_lines": "...",       # code snippet of the trace path
+        }
+    """
+    result: dict[str, Any] = {
+        "arg": "",
+        "source": "",
+        "source_detail": "",
+        "is_tainted": False,
+        "trace_lines": "",
+    }
+
+    lines = code.splitlines()
+
+    # Step 1: find the sink call and extract its argument
+    sink_pattern = re.compile(r'\b' + re.escape(sink_name) + r'\s*\(([^)]+)\)')
+    arg_name = ""
+    for line in lines:
+        m = sink_pattern.search(line)
+        if not m:
+            continue
+        raw_args = m.group(1).strip()
+
+        # For format-string sinks (sprintf/lxmldbc_system/…), the first arg
+        # is a destination or format string — the *dangerous* args are the
+        # ones that fill %s / %d / %n placeholders (args after the format).
+        if sink_name in _FORMAT_STRING_SINKS:
+            # Split args, skip the format string (2nd arg for sprintf,
+            # 1st arg for lxmldbc_system which is pure format).
+            parts = [a.strip() for a in raw_args.split(",")]
+            # lxmldbc_system(fmt, ...)  → fmt is parts[0]
+            # sprintf(dst, fmt, ...)    → fmt is parts[1]
+            # snprintf(dst, sz, fmt, …) → fmt is parts[2]
+            fmt_idx = 0
+            if sink_name in ("sprintf", "vsprintf"):
+                fmt_idx = 1
+            elif sink_name in ("snprintf", "fprintf"):
+                fmt_idx = 2
+            # Collect every arg AFTER the format string
+            extra_args = parts[fmt_idx + 1:]
+            # Return the first non-literal extra arg as the taint target
+            for a in extra_args:
+                a = a.strip()
+                if a and not a.startswith('"'):
+                    arg_name = a
+                    break
+            if arg_name:
+                break
+            # All extra args are literals → fall through (safe)
+            return result
+
+        # Non-format sinks: first arg is the dangerous one
+        arg_name = raw_args.split(",")[0].strip()
+        break
+
+    if not arg_name or arg_name.startswith('"'):
+        return result
+
+    result["arg"] = arg_name
+
+    # Step 2: search for assignments to arg_name in the code
+    # Patterns: arg = expr;  arg = func(...);  type arg = ...;
+    assign_pattern = re.compile(
+        r'(?:(?:\w+\s*\*?\s*)?)'  # optional type prefix
+        + re.escape(arg_name) + r'\s*=\s*(.+?);'
+    )
+
+    trace_lines = []
+    for line in lines:
+        m = assign_pattern.search(line)
+        if not m:
+            continue
+        rhs = m.group(1).strip()
+        trace_lines.append(line.strip())
+
+        # Check if RHS calls a taint source
+        for src in TAINT_SOURCES:
+            if src in rhs:
+                result["source"] = src
+                result["is_tainted"] = True
+                # Try to extract the argument of the taint source
+                src_m = re.search(re.escape(src) + r'\s*\(\s*"?([^")\s]+)', rhs)
+                if src_m:
+                    result["source_detail"] = src_m.group(1)
+                break
+
+        # If not a direct taint source, check for string concatenation
+        # involving the arg (e.g., sprintf(buf, "cmd %s", arg))
+        if not result["source"]:
+            for line2 in lines:
+                if arg_name in line2 and ("sprintf" in line2 or "strcat" in line2 or "strcpy" in line2):
+                    trace_lines.append(line2.strip())
+                    break
+
+        if result["source"]:
+            break
+
+    result["trace_lines"] = "\n".join(f"    {l}" for l in trace_lines[:5])
+    return result
+
+
+def classify_finding(sink: str, context: str) -> tuple[str, str, str, float]:
+    """Classify a finding based on sink type + context.
+
+    More accurate than pure table lookup:
+    - hardcoded arg -> lower confidence
+    - taint source in context -> higher confidence
+
+    Returns (cwe, description, severity, confidence).
+    """
+    cwe, desc, severity, confidence = _SINK_CLASSIFICATION.get(sink, _SINK_DEFAULT)
+
+    # Boost if taint source visible in context
+    for src in TAINT_SOURCES:
+        if src in context:
+            confidence = min(confidence + 0.2, 1.0)
+            if confidence > 0.7:
+                severity = "CRITICAL"
+            break
+
+    return cwe, desc, severity, confidence
+
+
+# ---------------------------------------------------------------------------
+# IDAHeadlessScanner — primary scanner, runs on headless IDA
+# ---------------------------------------------------------------------------
+
+
+class IDAHeadlessScanner:
+    """Systematic vulnerability scanner using headless IDA.
+
+    Python layer does mechanical pre-screening:
+    1. Find all sink callers
+    2. Filter hardcoded args (exclude safe calls)
+    3. Extract sink context (±8 lines, not full function)
+    4. Trace arg sources
+    5. Rank by risk
+
+    Output: refined candidate list for AI second-round triage.
+    """
+
+    def __init__(self, client: IDAHeadlessClient):
+        self.client = client
+
+    def find_dangerous_calls(self) -> list[dict]:
+        """Find all callers of dangerous sink functions.
+
+        Uses IDAHeadlessClient.imports_query() + xrefs_to() for
+        structured, batch-capable lookup.
+        """
+        results: list[dict] = []
+
+        # Get imports matching dangerous sinks
+        import_data = self.client.imports_query(DANGEROUS_SINKS)
+
+        # Collect unique import addresses
+        import_map: dict[str, dict] = {}
+        for entry in import_data:
+            if not isinstance(entry, dict):
+                continue
+            for imp in entry.get("data", []):
+                if isinstance(imp, dict) and imp.get("addr"):
+                    import_map[imp["addr"]] = imp
+
+        all_addrs = list(import_map.keys())
+        if not all_addrs:
+            return results
+
+        # Batch xrefs
+        try:
+            xrefs_data = self.client.xrefs_to(all_addrs)
+        except Exception:
+            logger.warning("xrefs query failed in headless scan", addr_count=len(all_addrs), exc_info=True)
+            return results
+
+        for entry in (xrefs_data if isinstance(xrefs_data, list) else []):
+            if not isinstance(entry, dict):
+                continue
+            imp_addr = entry.get("addr", "")
+            imp = import_map.get(imp_addr) or import_map.get(str(imp_addr))
+            if not imp:
+                continue
+            for xr in entry.get("xrefs", []):
+                if not isinstance(xr, dict):
+                    continue
+                if xr.get("type") != "code":
+                    continue
+                fn = xr.get("fn") or {}
+                results.append({
+                    "dangerous_func": imp.get("imported_name", ""),
+                    "import_addr": imp_addr,
+                    "caller_addr": xr.get("addr"),
+                    "caller_name": fn.get("name", "unknown"),
+                })
+        return results
+
+    def systematic_scan(self) -> list[VulnerabilityFinding]:
+        """Full pipeline: find sinks -> filter -> context -> rank.
+
+        Output VulnerabilityFinding.decompiled_code contains only
+        the ±8 line context snippet (not the full function).
+        AI uses this for quick triage, then requests full decompile
+        for candidates worth deeper analysis.
+        """
+        # Step 1: All dangerous calls
+        dangerous_calls = self.find_dangerous_calls()
+        logger.info("dangerous calls found", count=len(dangerous_calls))
+
+        # Step 2: Deduplicate by (caller, sink)
+        seen: set[str] = set()
+        unique: list[dict] = []
+        for dc in dangerous_calls:
+            key = f"{dc['caller_name']}:{dc['dangerous_func']}"
+            if key not in seen:
+                seen.add(key)
+                unique.append(dc)
+
+        logger.info("unique caller-sink pairs", count=len(unique))
+
+        # Step 3: Analyze each candidate
+        findings: list[VulnerabilityFinding] = []
+        for dc in unique:
+            sink = dc["dangerous_func"]
+            caller = dc["caller_name"]
+            caller_addr = dc["caller_addr"]
+
+            # Decompile full function (headless in-memory, no AI context cost)
+            # caller_addr may be a hex string — convert to int for IDA
+            try:
+                addr_int = int(caller_addr, 16) if isinstance(caller_addr, str) else caller_addr
+                full_code = self.client.decompile(addr_int)
+                if not full_code:
+                    continue
+                full_code = str(full_code)
+            except Exception:
+                logger.warning("decompile failed, skipping", caller=caller, addr=caller_addr)
+                continue
+
+            # Check if hardcoded arg -> safe, skip
+            if is_hardcoded_arg(full_code, sink):
+                logger.debug("skipping hardcoded arg", caller=caller, sink=sink)
+                continue
+
+            # Extract context snippet (±8 lines around sink)
+            context = extract_sink_context(full_code, sink, context_lines=8)
+
+            # Trace arg source
+            taint_info = trace_arg_source(full_code, sink)
+
+            # Classify
+            cwe, desc, severity, confidence = classify_finding(sink, context)
+
+            # Build source-sink path description
+            source_desc = ""
+            if taint_info["is_tainted"]:
+                source_desc = f"{taint_info['source']}({taint_info.get('source_detail', '')})"
+            # caller_addr is already a hex string from IDA
+            addr_str = caller_addr if isinstance(caller_addr, str) else hex(caller_addr)
+            source_sink = f"{source_desc} → {sink}" if source_desc else f"{sink} @ {addr_str}"
+
+            title = f"{sink}() call in {caller}" + (f" — {desc}" if desc else "")
+            findings.append(VulnerabilityFinding(
+                title=title,
+                severity=severity,
+                cwe_id=cwe,
+                vulnerable_function=caller,
+                vulnerable_address=str(caller_addr),
+                source_sink_path=source_sink,
+                description=taint_info.get("trace_lines", ""),
+                decompiled_code=context,  # Only ±8 lines, not full function
+                confidence=confidence,
+            ))
+
+        # Sort by confidence descending
+        findings.sort(key=lambda f: f.confidence, reverse=True)
+
+        logger.info("headless scan complete",
+                     total=len(findings),
+                     high_risk=sum(1 for f in findings if f.confidence >= 0.5))
+        return findings
+
+
+# ---------------------------------------------------------------------------
+# IDASystematicScanner — MCP-based scanner (optional, for interactive use)
+# ---------------------------------------------------------------------------
+
+
+class IDASystematicScanner:
+    """High-level scanner using IDA MCP (optional, for interactive use).
+
+    Prefer IDAHeadlessScanner for batch analysis.
+    """
+
+    def __init__(self, client: IDAMCPClient):
+        self.client = client
+
+    async def get_all_entrypoints(self) -> list[dict]:
+        """Return all CGI handlers / exported functions that process input."""
+        survey = await self.client.survey_binary()
+        eps = survey.get("entrypoints", [])
+        if not eps:
+            r = await self.client.call_tool("entity_query", {
+                "queries": [{"kind": "functions", "filter": "*main*"}]
+            })
+            eps = r if isinstance(r, list) else []
+        return eps
+
+    async def find_dangerous_calls(self) -> list[dict]:
+        """Scan all dangerous import calls and return their callers."""
+        results: list[dict] = []
+        import_data = await self.client.imports_query(DANGEROUS_SINKS)
+
+        import_map: dict[str, dict] = {}
+        for entry in import_data:
+            if not isinstance(entry, dict):
+                continue
+            for imp in entry.get("data", []):
+                if isinstance(imp, dict) and imp.get("addr"):
+                    import_map[imp["addr"]] = imp
+
+        all_addrs = list(import_map.keys())
+        if not all_addrs:
+            return results
+
+        try:
+            xrefs_data = await self.client.xrefs_to(all_addrs)
+        except Exception:
+            logger.warning("xrefs query failed in MCP scan", addr_count=len(all_addrs), exc_info=True)
+            return results
+
+        for entry in (xrefs_data if isinstance(xrefs_data, list) else []):
+            if not isinstance(entry, dict):
+                continue
+            imp_addr = entry.get("addr", "")
+            imp = import_map.get(imp_addr) or import_map.get(str(imp_addr))
+            if not imp:
+                continue
+            for xr in entry.get("xrefs", []):
+                if not isinstance(xr, dict):
+                    continue
+                if xr.get("type") != "code":
+                    continue
+                fn = xr.get("fn") or {}
+                results.append({
+                    "dangerous_func": imp.get("imported_name", ""),
+                    "import_addr": imp_addr,
+                    "caller_addr": xr.get("addr"),
+                    "caller_name": fn.get("name", "unknown"),
+                })
+        return results
+
+    async def systematic_vuln_scan(self) -> list[VulnerabilityFinding]:
+        """Systematic scan via MCP — same logic as IDAHeadlessScanner but async."""
+        dangerous_calls = await self.find_dangerous_calls()
+        logger.info("dangerous calls found", count=len(dangerous_calls))
+
+        seen: set[str] = set()
+        unique: list[dict] = []
+        for dc in dangerous_calls:
+            key = f"{dc['caller_name']}:{dc['dangerous_func']}"
+            if key not in seen:
+                seen.add(key)
+                unique.append(dc)
+
+        logger.info("unique caller-sink pairs", count=len(unique))
+
+        findings: list[VulnerabilityFinding] = []
+        for dc in unique:
+            sink = dc["dangerous_func"]
+            caller = dc["caller_name"]
+            caller_addr = dc["caller_addr"]
+            cwe, desc, severity, confidence = _SINK_CLASSIFICATION.get(sink, _SINK_DEFAULT)
+            title = f"{sink}() call in {caller}" + (f" — {desc}" if desc else "")
+            findings.append(VulnerabilityFinding(
+                title=title,
+                severity=severity,
+                cwe_id=cwe,
+                vulnerable_function=caller,
+                vulnerable_address=str(caller_addr),
+                source_sink_path=f"{sink} @ {dc['caller_addr']}",
+                confidence=confidence,
+            ))
+
+        # For top-risk functions, decompile to verify
+        high_risk = [f for f in findings if f.confidence >= 0.5]
+        for f in high_risk[:20]:
+            try:
+                code = await self.client.decompile(f.vulnerable_address)
+                full_code = str(code)
+
+                # Use analysis helpers for context extraction
+                f.decompiled_code = extract_sink_context(full_code, f.cwe_id.split()[-1] if " " in f.cwe_id else "", context_lines=8)
+
+                # Check hardcoded
+                sink_name = f.title.split("(")[0]
+                if is_hardcoded_arg(full_code, sink_name):
+                    f.confidence = 0.1
+                    f.severity = "LOW"
+                    continue
+
+                # Trace taint
+                taint_info = trace_arg_source(full_code, sink_name)
+                if taint_info["is_tainted"]:
+                    f.confidence = min(f.confidence + 0.2, 1.0)
+                    f.severity = "CRITICAL" if f.confidence > 0.7 else "HIGH"
+            except Exception:
+                logger.warning("MCP decompile/analyze failed, skipping",
+                               caller=caller, addr=caller_addr, exc_info=True)
+
+        findings.sort(key=lambda f: f.confidence, reverse=True)
+        logger.info("systematic scan complete", total=len(findings),
+                     high_risk=len(high_risk))
+        return findings

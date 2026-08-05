@@ -1,0 +1,9 @@
+.env
+elfs/
+data/
+reports/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.claude/settings.local.json
