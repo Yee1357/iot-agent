@@ -250,6 +250,38 @@ if (access(file, W_OK) == 0) {   // 检查权限
 
 ---
 
+## 模式 9：厂商特有 wrapper 注入（D-Link 示例）
+
+**厂商固件常有私有"命令执行 wrapper"**——代码里不直接调 `system()`，而是调厂商封装。工具代码不内置这些（保持厂商无关），**机器可读清单在 `knowledge/<vendor>.json`**（`iot_ida_headless_scan` 传 `vendor` 自动合并），文档里的模式给 agent 做人工判断参考。
+
+### 9a. xmldbc 命令注入（D-Link xmldbc 守护进程）
+
+```
+web 请求 → CGI handler → sobj_get_string() 提取参数
+  → lxmldbc_system("<拼接的命令>")     ← 实际就是 system()
+  → 或 xmldbc_ephp("<php 代码>")       ← PHP 代码注入
+```
+
+**识别特征**：
+- sink：`lxmldbc_system`（格式串第一个参数，等同 system）、`xmldbc_ephp` / `xmldbc_ephp_wb`（PHP 注入）
+- taint source：`sobj_get_string`（D-Link CGI 参数 getter）、`cgibin_parse_request`
+- 常见链路：`sobj_get_string → sprintf → lxmldbc_system`
+
+**判断要点**：
+- `lxmldbc_system` 第一个参数是格式化串——`%s` 里有用户数据即可疑
+- 检查参数是否经过 xmldbc 的转义（部分版本有 `xmldbc_escape`）
+- 跨版本复用：同厂商不同型号常共用同一 wrapper，函数名稳定可跨型号搜索
+
+**注意**：`sub_40A1C0` 这类地址符号只在特定固件出现，换固件即失效——优先记录稳定函数名；地址符号用 `iot_experience_record` 记入经验库并注明固件版本。
+
+### 9b. 如何发现新厂商的 wrapper
+
+1. L2 radare2 阶段加扫：`axt sym.imp.system` 之外，查 `strings <bin> | grep -i 'system\|popen'` 找厂商封装
+2. 反编译里看到 `system()` 的上层调用者名（如 `xxx_system_cmd`），去 `knowledge/<vendor>.json` 登记
+3. 登记后 `iot_ida_headless_scan(binary_path, vendor="<vendor>")` 自动生效
+
+---
+
 ## 快速匹配规则
 
 看到以下模式，直接标记**高优先级**：

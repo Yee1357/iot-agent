@@ -20,16 +20,15 @@ argument-hint: "[old_version] [new_version]"
 
 ### Step 2：获取新旧版本固件
 
-```python
-async with VMRemoteExecutor() as vm:
-    # 确保新旧两个版本的固件都已下载
-    await vm.execute("ls /data/firmwares/<vendor>/<model>_v1/")
-    await vm.execute("ls /data/firmwares/<vendor>/<model>_v2/")
+用 `iot_firmware_search_and_download(vendor, model, version=...)` 分别下载新旧版本，或：
+```text
+iot_vm_execute("ls /data/firmware/<vendor>/")
+iot_firmware_extract("/data/firmware/<vendor>/<model>_<version>.bin", brand=..., model=..., version=...)
 ```
 
 ### Step 3：解包
 
-两个版本分别 binwalk 解包。
+`iot_firmware_extract(...)` 分别解包两个版本（自动 binwalk + rootfs 标准化）。
 
 ### Step 4：定位修补位置
 
@@ -75,7 +74,9 @@ diff /tmp/old_funcs.txt /tmp/new_funcs.txt
 
 ### Step 7：验证
 
-对发现的可绕过路径，在 QEMU 上验证（参见 `iot-emulate-firmware`）。
+对发现的可绕过路径，用两级验证（参见 `iot-emulate-firmware`）：
+- 试错：`iot_emulation_user_mode(rootfs, command, arch)` — 命令注入类绕过 PoC
+- 正式验证：`iot_emulation_chroot_user_mode(rootfs, command, arch)` — 单服务复现，验证完 `iot_emulation_chroot_cleanup(workdir, remove_workdir=True)`
 
 ### Step 8：输出报告
 

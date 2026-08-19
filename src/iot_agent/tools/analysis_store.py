@@ -1,7 +1,15 @@
-"""Persistent storage for vulnerability analysis tasks and findings.
+"""Persistent storage for vulnerability analysis tasks, findings and experiences.
 
-SQLite-backed, supports JSON export. Tracks analysis progress across
-sessions so work can be resumed after interruption.
+SQLite-backed, supports JSON export. Three responsibilities:
+
+- **Tasks / findings** — track analysis progress across sessions so work can
+  be resumed after interruption; ``resume_task()`` returns still-pending
+  candidates (verdict != CONFIRMED/DISPROVED/WEAKENED).
+- **Experiences** — cross-session lessons (env pitfalls, reusable patterns,
+  false-positive rules, verification tricks) that let the agent iterate:
+  ``record_experience`` (dedup by category+vendor+arch+scenario),
+  ``search_experiences`` (compact digest), ``bump_experience`` (feedback).
+- **JSON export** — one-call task+findings dump for reports.
 
 Usage:
     from iot_agent.tools.analysis_store import AnalysisStore
@@ -18,11 +26,15 @@ Usage:
 
     # Record findings
     finding = VulnerabilityFinding(title="...", severity="HIGH", ...)
-    store.add_finding(task_id, finding, verdict="confirmed")
+    store.add_finding(task_id, finding, verdict="confirmed", binary_name="cgibin")
 
-    # Track progress
-    store.mark_level(task_id, 2)  # completed Level 2
-    store.mark_completed(task_id)
+    # Track progress / resume
+    store.mark_level(task_id, 2)          # completed Level 2
+    pending = store.resume_task(task_id)  # candidate-level checkpointing
+
+    # Experience memory
+    store.record_experience(category="pattern", scenario="...", detail="...")
+    store.search_experiences(vendor="dlink")
 
     # Export
     store.export_task_json(task_id, "./reports/dir-815.json")
@@ -31,6 +43,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -108,6 +121,25 @@ class AnalysisStore:
                 ON findings(task_id);
             CREATE INDEX IF NOT EXISTS idx_finding_verdict
                 ON findings(verdict);
+
+            CREATE TABLE IF NOT EXISTS experiences (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                category        TEXT NOT NULL DEFAULT 'general',
+                vendor          TEXT NOT NULL DEFAULT '',
+                arch            TEXT NOT NULL DEFAULT '',
+                scenario        TEXT NOT NULL,
+                detail          TEXT NOT NULL,
+                source_task_id  INTEGER,
+                success_count   INTEGER NOT NULL DEFAULT 1,
+                fail_count      INTEGER NOT NULL DEFAULT 0,
+                created_at      REAL NOT NULL,
+                updated_at      REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_exp_vendor
+                ON experiences(vendor, arch);
+            CREATE INDEX IF NOT EXISTS idx_exp_category
+                ON experiences(category);
         """)
         conn.commit()
 
@@ -204,6 +236,7 @@ class AnalysisStore:
         finding: VulnerabilityFinding,
         verdict: str = "pending",
         notes: str = "",
+        binary_name: str = "",
     ) -> int:
         """Record a VulnerabilityFinding. Returns finding id."""
         conn = self._get_conn()
@@ -221,7 +254,7 @@ class AnalysisStore:
             finding.severity,
             finding.cwe_id,
             finding.cve_id or "",
-            finding.vulnerable_function,
+            binary_name,
             finding.vulnerable_function,
             finding.vulnerable_address,
             finding.source_sink_path,
@@ -386,6 +419,286 @@ class AnalysisStore:
             "findings_by_verdict": by_verdict,
             "confirmed_by_severity": by_severity,
         }
+
+    # -------------------------------------------------------------------
+    # Resume support (candidate-level checkpointing)
+    # -------------------------------------------------------------------
+
+    def resume_task(self, task_id: int) -> dict:
+        """Return everything needed to resume an interrupted analysis task.
+
+        ``pending`` contains findings whose verdict still needs work:
+        ``pending`` / ``needs_dynamic`` (already-judged CONFIRMED / DISPROVED
+        / WEAKENED candidates are excluded so the agent skips them).
+        """
+        task = self.get_task(task_id)
+        if not task:
+            return {}
+        findings = self.get_findings(task_id)
+        pending = [
+            f for f in findings
+            if f["verdict"] in ("pending", "", "needs_dynamic")
+        ]
+        return {
+            "task": task,
+            "total_findings": len(findings),
+            "pending_candidates": pending,
+        }
+
+    # -------------------------------------------------------------------
+    # Experience memory (cross-session knowledge, not agent state)
+    # -------------------------------------------------------------------
+
+    def record_experience(
+        self,
+        category: str,
+        scenario: str,
+        detail: str,
+        vendor: str = "",
+        arch: str = "",
+        source_task_id: int | None = None,
+    ) -> int:
+        """Record a reusable lesson. Returns experience id.
+
+        If an entry with the same (category, vendor, arch, scenario) already
+        exists, its ``detail`` is refreshed instead of duplicating -- this is
+        how the memory self-iterates without growing unbounded.
+        """
+        conn = self._get_conn()
+        now = time.time()
+        row = conn.execute(
+            "SELECT id FROM experiences WHERE category = ? AND vendor = ? "
+            "AND arch = ? AND scenario = ?",
+            (category, vendor, arch, scenario),
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE experiences SET detail = ?, source_task_id = ?, "
+                "updated_at = ? WHERE id = ?",
+                (detail, source_task_id, now, row["id"]),
+            )
+            conn.commit()
+            logger.info("experience refreshed", exp_id=row["id"], category=category)
+            return row["id"]
+
+        cur = conn.execute("""
+            INSERT INTO experiences
+                (category, vendor, arch, scenario, detail,
+                 source_task_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (category, vendor, arch, scenario, detail,
+              source_task_id, now, now))
+        conn.commit()
+        logger.info("experience recorded", exp_id=cur.lastrowid, category=category)
+        return cur.lastrowid
+
+    def search_experiences(
+        self,
+        category: str = "",
+        vendor: str = "",
+        arch: str = "",
+        limit: int = 20,
+        summary_only: bool = True,
+    ) -> list[dict]:
+        """Query reusable lessons, optionally filtered by category/vendor/arch.
+
+        ``summary_only`` truncates ``detail`` so the agent can load a digest
+        without blowing the context window. Order: most-successful first.
+        """
+        conn = self._get_conn()
+        conditions: list[str] = []
+        params: list[object] = []
+        if category:
+            conditions.append("category = ?")
+            params.append(category)
+        if vendor:
+            conditions.append("LOWER(vendor) = LOWER(?)")
+            params.append(vendor)
+        if arch:
+            conditions.append("arch = ?")
+            params.append(arch)
+        where = " AND ".join(conditions) if conditions else "1=1"
+        query = (
+            f"SELECT * FROM experiences WHERE {where} "
+            f"ORDER BY (success_count - fail_count) DESC, updated_at DESC LIMIT ?"
+        )
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            if summary_only:
+                d["detail"] = d["detail"][:300]
+            out.append(d)
+        return out
+
+    def bump_experience(self, exp_id: int, success: bool = True) -> None:
+        """Mark an experience as having worked (or not) again."""
+        conn = self._get_conn()
+        field = "success_count" if success else "fail_count"
+        conn.execute(
+            f"UPDATE experiences SET {field} = {field} + 1, updated_at = ? "
+            "WHERE id = ?",
+            (time.time(), exp_id),
+        )
+        conn.commit()
+
+    def experience_stats(self) -> dict:
+        """Aggregate statistics about the experience memory."""
+        conn = self._get_conn()
+        by_category = {}
+        for row in conn.execute(
+            "SELECT category, COUNT(*) as cnt FROM experiences "
+            "GROUP BY category ORDER BY cnt DESC"
+        ).fetchall():
+            by_category[row["category"]] = row["cnt"]
+        by_vendor = {}
+        for row in conn.execute(
+            "SELECT vendor, COUNT(*) as cnt FROM experiences "
+            "WHERE vendor != '' GROUP BY vendor ORDER BY cnt DESC"
+        ).fetchall():
+            by_vendor[row["vendor"]] = row["cnt"]
+        total = conn.execute("SELECT COUNT(*) FROM experiences").fetchone()[0]
+        return {"total": total, "by_category": by_category, "by_vendor": by_vendor}
+
+    def ingest_report(
+        self,
+        report_path: str,
+        vendor: str = "",
+        arch: str = "",
+        category: str = "pattern",
+    ) -> list[int]:
+        """Parse a markdown analysis report and record each section as an experience.
+
+        Sections are split on ``## `` / ``### `` headings (skipping the
+        document title). Each section becomes one experience entry:
+        scenario=heading, detail=body (trimmed, max 1200 chars).
+        Returns the list of experience ids (0 recorded when nothing parseable).
+        """
+        from pathlib import Path
+
+        p = Path(report_path)
+        if not p.is_file():
+            logger.warning("report not found", path=report_path)
+            return []
+        try:
+            lines = p.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            logger.warning("report unreadable", path=report_path)
+            return []
+
+        sections: list[tuple[str, list[str]]] = []
+        current_title = ""
+        current_body: list[str] = []
+        for line in lines:
+            m = re.match(r"^#{2,3}\s+(.+?)\s*$", line.strip())
+            if m:
+                if current_title:
+                    sections.append((current_title, current_body))
+                current_title = m.group(1).strip()
+                current_body = []
+            elif current_title:
+                current_body.append(line)
+        if current_title:  # trailing section after the last heading
+            sections.append((current_title, current_body))
+
+        ids: list[int] = []
+        for title, body in sections:
+            detail = "\n".join(body).strip()
+            if not detail:
+                detail = "(no detail in report section)"
+            detail = detail[:1200]
+            ids.append(self.record_experience(
+                category=category,
+                scenario=f"[report] {title}",
+                detail=detail,
+                vendor=vendor,
+                arch=arch,
+            ))
+        logger.info("report ingested", path=report_path,
+                    sections=len(sections), recorded=len(ids))
+        return ids
+
+    def findings_insights(self, vendor: str = "") -> dict:
+        """Aggregate historical findings into reusable insights.
+
+        Groups by binary, sink and CWE with verdict distributions and
+        false-positive rates (disproved / total), so the agent can learn
+        "which sinks for this vendor are usually false positives".
+        """
+        conn = self._get_conn()
+        vendor_cond = ""
+        params: list[object] = []
+        if vendor:
+            vendor_cond = "AND LOWER(t.vendor) = LOWER(?)"
+            params.append(vendor)
+
+        def rows(query: str) -> list[dict]:
+            return [dict(r) for r in conn.execute(query, params).fetchall()]
+
+        by_binary = rows(f"""
+            SELECT f.binary_name AS name, COUNT(*) AS total,
+                   SUM(CASE WHEN f.verdict='confirmed' THEN 1 ELSE 0 END) AS confirmed,
+                   SUM(CASE WHEN f.verdict='disproved' THEN 1 ELSE 0 END) AS disproved,
+                   SUM(CASE WHEN f.verdict='weakened' THEN 1 ELSE 0 END) AS weakened,
+                   SUM(CASE WHEN f.verdict='needs_dynamic' THEN 1 ELSE 0 END) AS needs_dynamic
+            FROM findings f JOIN analysis_tasks t ON t.id = f.task_id
+            WHERE f.binary_name != '' {vendor_cond}
+            GROUP BY f.binary_name ORDER BY total DESC LIMIT 20
+        """)
+        by_sink = rows(f"""
+            SELECT SUBSTR(f.source_sink, 1, 60) AS sink, COUNT(*) AS total,
+                   SUM(CASE WHEN f.verdict='confirmed' THEN 1 ELSE 0 END) AS confirmed,
+                   SUM(CASE WHEN f.verdict='disproved' THEN 1 ELSE 0 END) AS disproved
+            FROM findings f JOIN analysis_tasks t ON t.id = f.task_id
+            WHERE f.source_sink != '' {vendor_cond}
+            GROUP BY sink ORDER BY total DESC LIMIT 20
+        """)
+        by_cwe = rows(f"""
+            SELECT f.cwe_id AS cwe, COUNT(*) AS total,
+                   SUM(CASE WHEN f.verdict='confirmed' THEN 1 ELSE 0 END) AS confirmed,
+                   SUM(CASE WHEN f.verdict='disproved' THEN 1 ELSE 0 END) AS disproved
+            FROM findings f JOIN analysis_tasks t ON t.id = f.task_id
+            WHERE f.cwe_id != '' {vendor_cond}
+            GROUP BY f.cwe_id ORDER BY total DESC LIMIT 20
+        """)
+        for group in (by_binary, by_sink, by_cwe):
+            for item in group:
+                total = item.get("total") or 0
+                disproved = item.get("disproved") or 0
+                item["disprove_rate"] = round(disproved / total, 2) if total else 0.0
+
+        return {
+            "vendor": vendor or "(all)",
+            "by_binary": by_binary,
+            "by_sink": by_sink,
+            "by_cwe": by_cwe,
+        }
+
+    def export_experience_markdown(
+        self,
+        category: str = "pattern",
+        min_success: int = 3,
+        limit: int = 20,
+    ) -> str:
+        """Export top experiences as a markdown block for manual promotion.
+
+        Used to solidify proven dynamic lessons (e.g. success_count >= 3)
+        back into the static knowledge docs (``iot-vuln-patterns.md``).
+        """
+        rows = self.search_experiences(
+            category=category, limit=limit, summary_only=False
+        )
+        rows = [r for r in rows if (r["success_count"] - r["fail_count"]) >= min_success]
+        if not rows:
+            return ""
+        out = [f"## {category} 经验（已固化候选，success≥{min_success}）", ""]
+        for r in rows:
+            out.append(f"### {r['scenario']}  (vendor={r['vendor'] or '-'}, arch={r['arch'] or '-'}, 成功{r['success_count']}/失败{r['fail_count']})")
+            out.append("")
+            out.append(r["detail"].strip())
+            out.append("")
+        return "\n".join(out)
 
     # -------------------------------------------------------------------
     # Internal helpers

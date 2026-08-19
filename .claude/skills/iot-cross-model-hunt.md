@@ -20,16 +20,12 @@ argument-hint: "[known_model] [vuln_description]"
 
 ### Step 2：获取同品牌其他型号固件
 
-```python
-async with VMRemoteExecutor() as vm:
-    # 根据厂商名，在 VM 上搜索已有固件
-    await vm.execute("ls /data/firmwares/<vendor>/")
-```
+用 `iot_firmware_search_and_download(vendor, model)` 搜索下载，或 `iot_vm_execute("ls /data/firmware/")` 查看 VM 上已有固件。
 
-如需下载新固件：
-```bash
-# 从厂商官网或其他来源下载
-wget -O /data/firmwares/<vendor>/<model>_<version>.bin <url>
+如需手动指定 URL：
+```text
+iot_vm_execute("wget -O /data/firmware/<vendor>/<model>_<version>.bin <url>", timeout=600)
+iot_firmware_extract("/data/firmware/<vendor>/<model>_<version>.bin", brand=..., model=..., version=...)
 ```
 
 ### Step 3：解包
@@ -59,7 +55,9 @@ wget -O /data/firmwares/<vendor>/<model>_<version>.bin <url>
 
 ### Step 6：动态验证
 
-对可疑受影响的型号，选 1-2 个启动 QEMU 模拟（参见 `iot-emulate-firmware`），验证 PoC 是否生效。
+对可疑受影响的型号，选 1-2 个用两级验证（参见 `iot-emulate-firmware`）：
+- 试错：`iot_emulation_user_mode(rootfs, command, arch)`（先 `iot_emulation_detect_arch` + `iot_emulation_ensure_qemu`）
+- 正式验证：`iot_emulation_chroot_user_mode(rootfs, command, arch)`，验证完 `iot_emulation_chroot_cleanup(workdir, remove_workdir=True)`
 
 ### Step 7：输出影响范围报告
 
@@ -70,6 +68,8 @@ wget -O /data/firmwares/<vendor>/<model>_<version>.bin <url>
 | DIR-815 | 存在，代码一致 | 无差异 | CONFIRMED |
 | DIR-860L | 存在，有差异 | system() 调用前增加了白名单检查 | DISPROVED |
 ```
+
+**经验沉淀**：跨型号比对发现的可复用模式（如"某函数在所有型号都无过滤"）记录到 `iot_experience_record(category="pattern", ...)`。
 
 ---
 

@@ -4,13 +4,20 @@ Provides IDAHeadlessScanner (primary, runs on headless IDA) and
 IDASystematicScanner (optional, runs on MCP). Both produce
 VulnerabilityFinding lists for AI consumption.
 
+Vendor neutrality: the scanners contain ONLY generic sink/source lists.
+Vendor-specific sinks / taint sources live in the ``knowledge/`` directory
+(project root, one JSON per vendor) and are merged at runtime when a
+``vendor`` argument is given -- see ``load_vendor_knowledge``.
+
 Analysis helpers (extract_sink_context, is_hardcoded_arg, etc.) are
 pure Python functions that operate on decompiled pseudocode strings.
 """
 
 from __future__ import annotations
 
+import json
 import re
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -25,7 +32,7 @@ logger = structlog.get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants (generic only — vendor specifics come from knowledge/)
 # ---------------------------------------------------------------------------
 
 DANGEROUS_SINKS = [
@@ -33,15 +40,10 @@ DANGEROUS_SINKS = [
     "memcpy", "read", "recv", "fread",
     "system", "popen", "execve", "execl", "execlp",
     "printf", "fprintf", "vsprintf", "snprintf",
-    # IoT firmware wrappers — often the real sink behind system()
-    "lxmldbc_system",
-    "xmldbc_ephp", "xmldbc_ephp_wb",
 ]
 
 TAINT_SOURCES = [
     "getenv", "recv", "read", "fread", "fgets",
-    "cgibin_parse_request", "sobj_get_string",
-    "sub_40A1C0", "sub_405550",  # D-Link CGI parameter getters
 ]
 
 # sink -> (CWE, description, severity, confidence)
@@ -51,9 +53,6 @@ _SINK_CLASSIFICATION: dict[str, tuple[str, str, str, float]] = {
     "execve":   ("CWE-78", "command injection",  "HIGH", 0.6),
     "execl":    ("CWE-78", "command injection",  "HIGH", 0.6),
     "execlp":   ("CWE-78", "command injection",  "HIGH", 0.6),
-    "lxmldbc_system": ("CWE-78", "command injection (xmldbc wrapper)", "HIGH", 0.7),
-    "xmldbc_ephp":    ("CWE-78", "PHP code injection",  "HIGH", 0.6),
-    "xmldbc_ephp_wb": ("CWE-78", "PHP code injection",  "HIGH", 0.6),
     "sprintf":  ("CWE-121", "buffer overflow",   "HIGH", 0.5),
     "vsprintf": ("CWE-121", "buffer overflow",   "HIGH", 0.5),
     "strcpy":   ("CWE-120", "buffer overflow risk", "HIGH", 0.4),
@@ -61,6 +60,100 @@ _SINK_CLASSIFICATION: dict[str, tuple[str, str, str, float]] = {
     "gets":     ("CWE-120", "buffer overflow risk", "HIGH", 0.4),
 }
 _SINK_DEFAULT = ("CWE-20", "", "MEDIUM", 0.2)
+
+
+# ---------------------------------------------------------------------------
+# Vendor knowledge loading (knowledge/<vendor>.json at project root)
+# ---------------------------------------------------------------------------
+
+_KNOWLEDGE_DIR = Path(__file__).resolve().parents[3] / "knowledge"
+
+
+def load_vendor_knowledge(vendor: str = "") -> dict[str, Any]:
+    """Load vendor-specific sinks/taint sources from the knowledge directory.
+
+    Returns ``{"vendor", "sinks": {name: {...}}, "taint_sources": [...]}``.
+    Empty (no vendor / file missing / unreadable) returns an empty profile --
+    callers simply fall back to the generic lists.
+    """
+    empty = {"vendor": vendor, "sinks": {}, "taint_sources": []}
+    if not vendor:
+        return empty
+    path = _KNOWLEDGE_DIR / f"{vendor.strip().lower()}.json"
+    if not path.is_file():
+        logger.debug("no vendor knowledge file", vendor=vendor, path=str(path))
+        return empty
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        logger.warning("vendor knowledge unreadable", vendor=vendor, path=str(path))
+        return empty
+    return {
+        "vendor": data.get("vendor", vendor),
+        "sinks": data.get("sinks", {}),
+        "taint_sources": data.get("taint_sources", []),
+    }
+
+
+def list_vendor_knowledge() -> list[dict[str, Any]]:
+    """List available vendor knowledge files (knowledge/*.json).
+
+    Each entry: {"vendor", "file", "sinks", "taint_sources"}. Used by the
+    agent at hunt start to check whether the target vendor has machine
+    knowledge to merge into the scan.
+    """
+    out: list[dict[str, Any]] = []
+    if not _KNOWLEDGE_DIR.is_dir():
+        return out
+    for p in sorted(_KNOWLEDGE_DIR.glob("*.json")):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            data = {}
+        out.append({
+            "vendor": data.get("vendor", p.stem),
+            "file": p.name,
+            "sinks": len(data.get("sinks", {}) or {}),
+            "taint_sources": len(data.get("taint_sources", []) or []),
+        })
+    return out
+
+
+# Format-string sinks: the dangerous arg is NOT the format string (1st arg),
+# but the variadic args that get interpolated.  A format string containing
+# %s / %n / %x means external data flows in → must NOT be treated as safe.
+# Generic set; vendor format-string sinks are merged per scan (see
+# _merge_vendor_knowledge).
+_FORMAT_STRING_SINKS = {"sprintf", "vsprintf", "snprintf", "fprintf",
+                        "printf", "syslog"}
+
+
+def _merge_vendor_knowledge(
+    vendor: str = "",
+) -> tuple[list[str], list[str], dict[str, tuple[str, str, str, float]], set[str]]:
+    """Merge vendor knowledge over the generic lists.
+
+    Returns (sinks, taint_sources, sink_classification, format_string_sinks).
+    """
+    kn = load_vendor_knowledge(vendor)
+    sinks = list(DANGEROUS_SINKS)
+    taint = list(TAINT_SOURCES)
+    classification = dict(_SINK_CLASSIFICATION)
+    format_sinks = set(_FORMAT_STRING_SINKS)
+
+    for name, info in kn["sinks"].items():
+        sinks.append(name)
+        classification[name] = (
+            info.get("cwe", _SINK_DEFAULT[0]),
+            info.get("description", ""),
+            info.get("severity", _SINK_DEFAULT[2]),
+            float(info.get("confidence", _SINK_DEFAULT[3])),
+        )
+        if info.get("format_string"):
+            format_sinks.add(name)
+
+    taint.extend(kn["taint_sources"])
+    return sinks, taint, classification, format_sinks
 
 
 # ---------------------------------------------------------------------------
@@ -97,21 +190,22 @@ def extract_sink_context(code: str, sink_name: str, context_lines: int = 8) -> s
     return "\n".join(result)
 
 
-# Format-string sinks: the dangerous arg is NOT the format string (1st arg),
-# but the variadic args that get interpolated.  A format string containing
-# %s / %n / %x means external data flows in → must NOT be treated as safe.
-_FORMAT_STRING_SINKS = {"sprintf", "vsprintf", "snprintf", "fprintf",
-                        "printf", "syslog", "lxmldbc_system"}
-
-
-def is_hardcoded_arg(code: str, sink_name: str) -> bool:
+def is_hardcoded_arg(
+    code: str,
+    sink_name: str,
+    format_string_sinks: set[str] | None = None,
+) -> bool:
     """Check if a sink's argument is a hardcoded string constant.
 
     system("reboot")  -> True  (safe, can exclude)
     system(cmd_buf)   -> False (needs further analysis)
     sprintf(buf, "svc %s", input) -> False (format string has %s)
     sprintf(buf, "Content-Type: text/html") -> True (no placeholders)
+
+    ``format_string_sinks`` overrides the generic format-sink set (used when
+    vendor knowledge adds vendor format sinks).
     """
+    format_sinks = format_string_sinks if format_string_sinks is not None else _FORMAT_STRING_SINKS
     # Find the sink call line — match the outermost call only
     pattern = re.compile(r'\b' + re.escape(sink_name) + r'\s*\((.+)')
     for line in code.splitlines():
@@ -120,16 +214,16 @@ def is_hardcoded_arg(code: str, sink_name: str) -> bool:
             continue
         arg_part = m.group(1).strip()
 
-        # --- Format-string sinks (sprintf / lxmldbc_system / …) ----------
-        # The format string may be arg[0] (lxmldbc_system) or arg[1]
+        # --- Format-string sinks (sprintf / vendor wrappers / …) ----------
+        # The format string may be arg[0] (vendor wrapper sinks) or arg[1]
         # (sprintf) or arg[2] (snprintf).  We find the first string
         # literal in the arg list and treat that as the format string.
-        if sink_name in _FORMAT_STRING_SINKS:
+        if sink_name in format_sinks:
             # Find all string-literal positions in the full arg text
             all_strs = list(re.finditer(r'"([^"]*)"', arg_part))
             if not all_strs:
                 return False  # no literal at all → not hardcoded
-            # Pick the format string: for lxmldbc_system it's the 1st;
+            # Pick the format string: for arg[0]-format sinks it's the 1st;
             # for sprintf/vsprintf it's the 2nd; for snprintf/fprintf 3rd.
             fmt_pos = 0
             if sink_name in ("sprintf", "vsprintf"):
@@ -181,8 +275,16 @@ def is_hardcoded_arg(code: str, sink_name: str) -> bool:
     return False
 
 
-def trace_arg_source(code: str, sink_name: str) -> dict[str, Any]:
+def trace_arg_source(
+    code: str,
+    sink_name: str,
+    taint_sources: list[str] | None = None,
+    format_string_sinks: set[str] | None = None,
+) -> dict[str, Any]:
     """Trace the source of a sink's argument (1-2 hop def-use chain).
+
+    ``taint_sources`` / ``format_string_sinks`` override the generic lists
+    (used when vendor knowledge is merged into the scan).
 
     Returns:
         {
@@ -193,6 +295,8 @@ def trace_arg_source(code: str, sink_name: str) -> dict[str, Any]:
             "trace_lines": "...",       # code snippet of the trace path
         }
     """
+    taint = taint_sources if taint_sources is not None else TAINT_SOURCES
+    format_sinks = format_string_sinks if format_string_sinks is not None else _FORMAT_STRING_SINKS
     result: dict[str, Any] = {
         "arg": "",
         "source": "",
@@ -212,14 +316,14 @@ def trace_arg_source(code: str, sink_name: str) -> dict[str, Any]:
             continue
         raw_args = m.group(1).strip()
 
-        # For format-string sinks (sprintf/lxmldbc_system/…), the first arg
+        # For format-string sinks (sprintf/vendor wrappers/…), the first arg
         # is a destination or format string — the *dangerous* args are the
         # ones that fill %s / %d / %n placeholders (args after the format).
-        if sink_name in _FORMAT_STRING_SINKS:
+        if sink_name in format_sinks:
             # Split args, skip the format string (2nd arg for sprintf,
-            # 1st arg for lxmldbc_system which is pure format).
+            # 1st arg for arg[0]-format sinks which is pure format).
             parts = [a.strip() for a in raw_args.split(",")]
-            # lxmldbc_system(fmt, ...)  → fmt is parts[0]
+            # arg0-format sink(fmt, ...) → fmt is parts[0]
             # sprintf(dst, fmt, ...)    → fmt is parts[1]
             # snprintf(dst, sz, fmt, …) → fmt is parts[2]
             fmt_idx = 0
@@ -265,7 +369,7 @@ def trace_arg_source(code: str, sink_name: str) -> dict[str, Any]:
         trace_lines.append(line.strip())
 
         # Check if RHS calls a taint source
-        for src in TAINT_SOURCES:
+        for src in taint:
             if src in rhs:
                 result["source"] = src
                 result["is_tainted"] = True
@@ -290,7 +394,12 @@ def trace_arg_source(code: str, sink_name: str) -> dict[str, Any]:
     return result
 
 
-def classify_finding(sink: str, context: str) -> tuple[str, str, str, float]:
+def classify_finding(
+    sink: str,
+    context: str,
+    sink_classification: dict[str, tuple[str, str, str, float]] | None = None,
+    taint_sources: list[str] | None = None,
+) -> tuple[str, str, str, float]:
     """Classify a finding based on sink type + context.
 
     More accurate than pure table lookup:
@@ -299,10 +408,12 @@ def classify_finding(sink: str, context: str) -> tuple[str, str, str, float]:
 
     Returns (cwe, description, severity, confidence).
     """
-    cwe, desc, severity, confidence = _SINK_CLASSIFICATION.get(sink, _SINK_DEFAULT)
+    classification = sink_classification if sink_classification is not None else _SINK_CLASSIFICATION
+    taint = taint_sources if taint_sources is not None else TAINT_SOURCES
+    cwe, desc, severity, confidence = classification.get(sink, _SINK_DEFAULT)
 
     # Boost if taint source visible in context
-    for src in TAINT_SOURCES:
+    for src in taint:
         if src in context:
             confidence = min(confidence + 0.2, 1.0)
             if confidence > 0.7:
@@ -328,10 +439,20 @@ class IDAHeadlessScanner:
     5. Rank by risk
 
     Output: refined candidate list for AI second-round triage.
+
+    ``vendor`` (optional) merges vendor-specific sinks/taint sources from
+    ``knowledge/<vendor>.json`` -- the scanner stays vendor-neutral by default.
     """
 
-    def __init__(self, client: IDAHeadlessClient):
+    def __init__(self, client: IDAHeadlessClient, vendor: str = ""):
         self.client = client
+        self.vendor = vendor
+        (
+            self.sinks,
+            self.taint_sources,
+            self.sink_classification,
+            self.format_string_sinks,
+        ) = _merge_vendor_knowledge(vendor)
 
     def find_dangerous_calls(self) -> list[dict]:
         """Find all callers of dangerous sink functions.
@@ -342,7 +463,7 @@ class IDAHeadlessScanner:
         results: list[dict] = []
 
         # Get imports matching dangerous sinks
-        import_data = self.client.imports_query(DANGEROUS_SINKS)
+        import_data = self.client.imports_query(self.sinks)
 
         # Collect unique import addresses
         import_map: dict[str, dict] = {}
@@ -428,7 +549,7 @@ class IDAHeadlessScanner:
                 continue
 
             # Check if hardcoded arg -> safe, skip
-            if is_hardcoded_arg(full_code, sink):
+            if is_hardcoded_arg(full_code, sink, self.format_string_sinks):
                 logger.debug("skipping hardcoded arg", caller=caller, sink=sink)
                 continue
 
@@ -436,10 +557,18 @@ class IDAHeadlessScanner:
             context = extract_sink_context(full_code, sink, context_lines=8)
 
             # Trace arg source
-            taint_info = trace_arg_source(full_code, sink)
+            taint_info = trace_arg_source(
+                full_code, sink,
+                taint_sources=self.taint_sources,
+                format_string_sinks=self.format_string_sinks,
+            )
 
             # Classify
-            cwe, desc, severity, confidence = classify_finding(sink, context)
+            cwe, desc, severity, confidence = classify_finding(
+                sink, context,
+                sink_classification=self.sink_classification,
+                taint_sources=self.taint_sources,
+            )
 
             # Build source-sink path description
             source_desc = ""
@@ -482,8 +611,15 @@ class IDASystematicScanner:
     Prefer IDAHeadlessScanner for batch analysis.
     """
 
-    def __init__(self, client: IDAMCPClient):
+    def __init__(self, client: IDAMCPClient, vendor: str = ""):
         self.client = client
+        self.vendor = vendor
+        (
+            self.sinks,
+            self.taint_sources,
+            self.sink_classification,
+            self.format_string_sinks,
+        ) = _merge_vendor_knowledge(vendor)
 
     async def get_all_entrypoints(self) -> list[dict]:
         """Return all CGI handlers / exported functions that process input."""
@@ -499,7 +635,7 @@ class IDASystematicScanner:
     async def find_dangerous_calls(self) -> list[dict]:
         """Scan all dangerous import calls and return their callers."""
         results: list[dict] = []
-        import_data = await self.client.imports_query(DANGEROUS_SINKS)
+        import_data = await self.client.imports_query(self.sinks)
 
         import_map: dict[str, dict] = {}
         for entry in import_data:
@@ -560,7 +696,7 @@ class IDASystematicScanner:
             sink = dc["dangerous_func"]
             caller = dc["caller_name"]
             caller_addr = dc["caller_addr"]
-            cwe, desc, severity, confidence = _SINK_CLASSIFICATION.get(sink, _SINK_DEFAULT)
+            cwe, desc, severity, confidence = self.sink_classification.get(sink, _SINK_DEFAULT)
             title = f"{sink}() call in {caller}" + (f" — {desc}" if desc else "")
             findings.append(VulnerabilityFinding(
                 title=title,
@@ -584,13 +720,17 @@ class IDASystematicScanner:
 
                 # Check hardcoded
                 sink_name = f.title.split("(")[0]
-                if is_hardcoded_arg(full_code, sink_name):
+                if is_hardcoded_arg(full_code, sink_name, self.format_string_sinks):
                     f.confidence = 0.1
                     f.severity = "LOW"
                     continue
 
                 # Trace taint
-                taint_info = trace_arg_source(full_code, sink_name)
+                taint_info = trace_arg_source(
+                    full_code, sink_name,
+                    taint_sources=self.taint_sources,
+                    format_string_sinks=self.format_string_sinks,
+                )
                 if taint_info["is_tainted"]:
                     f.confidence = min(f.confidence + 0.2, 1.0)
                     f.severity = "CRITICAL" if f.confidence > 0.7 else "HIGH"

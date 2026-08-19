@@ -1,53 +1,328 @@
-"""Emulation environment management -- QEMU system mode + FirmAE on the VM.
+"""Dynamic verification on the VM -- two tiers: quick probe + chroot-wrapped qemu-user.
 
 Design rules (also enforced in .claude/skills/iot-emulate-firmware.md):
 
-1. Kernels are NEVER guessed or searched for: ``match_kernel()`` first tries
-   a kernel embedded in the rootfs, then reads the kernel manifest
-   (``kernel_assets.ensure_kernel``).
-2. Manual QEMU boots from per-arch templates (``boot-templates.json``), not
-   from command lines invented on the spot.
-3. FirmAE is the preferred system-emulation path; ``start_firmae()`` runs the
-   full init + run flow in the background and polls logs to report whether
-   the device actually booted (and why not, if it failed).
-4. For single-service verification (CGI/daemon), ``chroot_launch()`` prepares
-   a chroot of the extracted rootfs with proc/dev/tmp mounts and the arch
-   matched libnvram, then optionally starts the target service -- no full
-   system emulation needed.
+1. Full-system emulation (FirmAE, manual QEMU system mode) is REMOVED --
+   in practice it was the least reliable part of agent-driven analysis.
+
+2. Dynamic verification has exactly two tiers:
+   - **Probe (``user_mode_run``)**: ``qemu-<arch>-static -L <rootfs> <cmd>``.
+     Cheap (no sudo, no mounts), but the guest's absolute paths fall through
+     to the HOST filesystem (``-L`` only redirects loader/libs). Use it to
+     quickly confirm/exclude a sink BEFORE spending setup on the real
+     verification. Its result alone is NEVER a final verdict.
+   - **Verification (``chroot_user_mode``)**: copy the rootfs to a working
+     copy, bind-mount /dev /dev/pts /proc, copy the qemu binary inside, then
+     ``chroot <workdir> /usr/bin/qemu-<arch>-static -- <cmd>``. The qemu
+     process itself is chrooted, so the guest sees the device view: /etc,
+     /var/run, /bin/sh (busybox), /tmp are all inside the rootfs copy, and
+     fork/exec of firmware binaries keeps being translated. This is the ONLY
+     path whose result counts as a dynamic verdict. No binfmt_misc needed.
+3. The binfmt-based ``chroot_launch`` (chroot + rely on host kernel
+   binfmt_misc to interpret the ELF) is REMOVED: chroot-wrapped qemu-user is
+   strictly more faithful and has no binfmt dependency.
+4. qemu binaries are located automatically (``/usr/local/bin`` -> PATH ->
+   bounded ``find``); never guessed. If missing, the caller reports the
+   install command and escalates to the user (upgrade path L3).
 """
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import hashlib
-import json
-import re
-import time
 
 import structlog
 
 from iot_agent.config import settings
-from iot_agent.tools import kernel_assets
+from iot_agent.tools import runtime_assets
 from iot_agent.tools.remote_vm import VMRemoteExecutor
 
 logger = structlog.get_logger(__name__)
 
-# Boot markers found in FirmAE serial logs / run logs
-_BOOT_OK_MARKERS = [
-    "login:", "init started", "starting network", "busybox v", "starting pid",
-]
-_BOOT_FAIL_MARKERS = [
-    "kernel panic", "no init found", "unable to mount root",
-    "qemu: fatal", "attempted to kill init",
-]
+#: user-mode qemu binary per detected architecture
+_QEMU_USER = {
+    "mips": "qemu-mips-static",
+    "mipsel": "qemu-mipsel-static",
+    "arm": "qemu-arm-static",
+    "aarch64": "qemu-aarch64-static",
+    "x86": "qemu-x86_64-static",
+    "i386": "qemu-i386-static",
+}
 
 
 class EmulationManager:
-    """Manages QEMU system-mode emulation and FirmAE on the analysis VM."""
+    """Manages lightweight dynamic verification (probe / chroot+qemu) on the VM."""
 
     def __init__(self, vm: VMRemoteExecutor):
         self.vm = vm
+
+    # ------------------------------------------------------------------
+    # qemu binary discovery
+    # ------------------------------------------------------------------
+
+    async def find_qemu(self, arch: str) -> str:
+        """Locate ``qemu-<arch>-static`` on the VM. Returns absolute path or "".
+
+        Search order: PATH (``command -v``) -> /usr/local/bin ->
+        bounded find under /usr /opt /data. Never guesses filenames.
+        """
+        name = _QEMU_USER.get(arch, "")
+        if not name:
+            return ""
+        r = await self.vm.execute(
+            f"command -v {name} 2>/dev/null || ls /usr/local/bin/{name} 2>/dev/null || "
+            f"find /usr /opt /data -maxdepth 4 -name '{name}' -type f 2>/dev/null | head -1"
+        )
+        path = r.stdout.strip().splitlines()[0] if r.stdout.strip() else ""
+        return path or ""
+
+    async def ensure_qemu(self, arch: str) -> dict:
+        """Locate qemu for ``arch`` and report. Returns {"arch", "found", "path", "install_hint"}."""
+        path = await self.find_qemu(arch)
+        if path:
+            return {"arch": arch, "found": True, "path": path, "install_hint": ""}
+        return {
+            "arch": arch,
+            "found": False,
+            "path": "",
+            "install_hint": f"sudo apt-get install -y qemu-user-static   # or place {_QEMU_USER.get(arch, 'qemu-<arch>-static')} in /usr/local/bin",
+        }
+
+    # ------------------------------------------------------------------
+    # Tier 1: quick probe (-L). NOT a final verdict.
+    # ------------------------------------------------------------------
+
+    async def user_mode_run(
+        self,
+        rootfs_path: str,
+        command: str,
+        arch: str = "",
+    ) -> dict:
+        """Quick probe: run ``command`` via qemu user-mode with ``-L rootfs``.
+
+        WARNING: guest absolute paths (/etc, /tmp, /bin/sh) fall through to
+        the HOST filesystem -- only loader/libs are redirected. Use this to
+        confirm/exclude a sink cheaply; final verdicts require
+        ``chroot_user_mode``.
+
+        Returns ``{"started", "exit_code", "stdout", "stderr", "arch", "qemu"}``.
+        """
+        arch = arch or (await self.detect_arch(rootfs_path)) or ""
+        qemu = await self.find_qemu(arch)
+        if not qemu:
+            return {
+                "started": False,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"qemu-{arch}-static not found on VM (hint: apt-get install qemu-user-static)",
+                "arch": arch,
+                "qemu": "",
+            }
+        result = await self.vm.execute(f"{qemu} -L {rootfs_path} {command}", timeout=120)
+        logger.info("user-mode probe", arch=arch, qemu=qemu, success=result.success)
+        return {
+            "started": result.success,
+            "exit_code": result.exit_code,
+            "stdout": result.stdout[-4000:],
+            "stderr": result.stderr[-2000:],
+            "arch": arch,
+            "qemu": qemu,
+        }
+
+    # ------------------------------------------------------------------
+    # Tier 2: chroot-wrapped qemu-user. THE dynamic verification path.
+    # ------------------------------------------------------------------
+
+    async def chroot_user_mode(
+        self,
+        rootfs_path: str,
+        command: str,
+        arch: str = "",
+        workdir: str = "",
+        inject_nvram: bool = False,
+        timeout: int = 120,
+    ) -> dict:
+        """Verify by running ``command`` inside a chroot of the rootfs.
+
+        Mirrors the proven one-shot repro pattern: copy the rootfs to a
+        working copy (never touch the original), copy the qemu binary inside,
+        bind-mount /dev /dev/pts /proc, then
+
+            sudo chroot <workdir> /usr/bin/qemu-<arch>-static [env...] -- <command>
+
+        Because the qemu process is chrooted, guest absolute paths (/etc,
+        /var/run, /tmp, /bin/sh) resolve inside the working copy and
+        fork/exec of firmware binaries keeps being translated. No binfmt
+        dependency. This result MAY be used as a dynamic verdict.
+
+        Steps: provision qemu -> copy rootfs (idempotent) -> mounts ->
+        launch in background (setsid, pidfile) -> survival check.
+
+        Returns ``{"started", "stage", "workdir", "qemu", "pid", "log_tail", "error"}``.
+        """
+        arch = arch or (await self.detect_arch(rootfs_path)) or ""
+        qemu = await self.find_qemu(arch)
+        if not qemu:
+            hint = _QEMU_USER.get(arch, "")
+            return {
+                "started": False,
+                "stage": "qemu_missing",
+                "workdir": "",
+                "qemu": "",
+                "pid": "",
+                "log_tail": "",
+                "error": (
+                    f"qemu-{arch}-static not found on VM "
+                    f"(hint: sudo apt-get install -y qemu-user-static or place {hint} in /usr/local/bin)"
+                ),
+            }
+
+        rootfs = rootfs_path.rstrip("/")
+        workdir = (workdir or f"{rootfs}.chroot-qemu").rstrip("/")
+        if workdir == "/" or not workdir.startswith("/"):
+            return {
+                "started": False,
+                "stage": "bad_workdir",
+                "workdir": workdir,
+                "error": "refusing unsafe workdir path",
+                "log_tail": "",
+            }
+
+        password = settings.vm_ssh_password
+
+        def sudo(cmd: str) -> str:
+            return f"echo '{password}' | sudo -S -p '' {cmd}"
+
+        # 1) sudo credential cache
+        r = await self.vm.execute(f"{sudo('-v')} 2>/dev/null && echo SUDO_OK")
+        if "SUDO_OK" not in r.stdout:
+            return {
+                "started": False,
+                "stage": "sudo",
+                "workdir": workdir,
+                "error": "sudo credential check failed",
+                "log_tail": r.stderr[:300],
+            }
+
+        # 2) working copy (idempotent): fresh copy only when missing or stale
+        qemu_in_chroot = f"{workdir}/usr/bin/{_QEMU_USER.get(arch)}"
+        need_copy = False
+        check = await self.vm.execute(f"test -d {workdir}/usr/sbin && test -f {qemu_in_chroot} && echo OK")
+        if "OK" not in check.stdout:
+            need_copy = True
+        if need_copy:
+            logger.info("building chroot working copy", src=rootfs, dst=workdir)
+            await self.vm.execute(
+                f"{sudo(f'rm -rf {workdir}')}; {sudo(f'mkdir -p {workdir}')}; "
+                f"{sudo(f'cp -a {rootfs}/. {workdir}/')}; "
+                f"{sudo(f'mkdir -p {workdir}/usr/bin {workdir}/dev/pts {workdir}/proc {workdir}/tmp')}; "
+                f"{sudo(f'cp -f {qemu} {qemu_in_chroot}')}; "
+                f"{sudo('chmod 755 %s' % qemu_in_chroot)}"
+            )
+
+        # 3) optional libnvram injection (LD_PRELOAD via qemu -E)
+        env_prefix = ""
+        if inject_nvram:
+            nvram_name = runtime_assets.ARCH_RUNTIME.get(arch, {}).get("libnvram", "")
+            if nvram_name:
+                await runtime_assets.provision_runtime_assets(self.vm)
+                nvram_src = f"{runtime_assets.runtime_dir()}/{nvram_name}"
+                await self.vm.execute(
+                    f"{sudo(f'cp -f {nvram_src} {workdir}/lib/libnvram.so')} 2>/dev/null || true"
+                )
+                env_prefix = "-E LD_PRELOAD=/lib/libnvram.so "
+
+        # 4) bind mounts (dev/dev/pts/proc) + tmpfs /var/tmp + /var/run.
+        # NB: firmware rootfs /var is usually a tmpfs at runtime -- /tmp is a
+        # symlink to /var/tmp and /var/run does not exist in the image.
+        # Without them the guest cannot write /tmp or /var/run at all
+        # ("can't create"), which breaks daemons and lxmldbc scripts.
+        mounts = await self.vm.execute(
+            f"{sudo(f'mkdir -p {workdir}/var/tmp {workdir}/var/run')}; "
+            f"mountpoint -q {workdir}/dev || {sudo(f'mount --bind /dev {workdir}/dev')}; "
+            f"mountpoint -q {workdir}/dev/pts || {sudo(f'mount --bind /dev/pts {workdir}/dev/pts')}; "
+            f"mountpoint -q {workdir}/proc || {sudo(f'mount -t proc /proc {workdir}/proc')}; "
+            f"mountpoint -q {workdir}/var/tmp || {sudo(f'mount -t tmpfs tmpfs {workdir}/var/tmp')}; "
+            f"mountpoint -q {workdir}/var/run || {sudo(f'mount -t tmpfs tmpfs {workdir}/var/run')}; "
+            f"mount | grep {workdir} | head -7"
+        )
+
+        # 5) launch: base64-encoded setsid script so the SSH channel closes
+        base = hashlib.sha256((workdir + command).encode("utf-8")).hexdigest()[:12]
+        logpath = f"/tmp/chrootqemu-{base}.log"
+        pidfile = f"{logpath}.pid"
+        script = (
+            f"setsid nohup chroot {workdir} /usr/bin/{_QEMU_USER.get(arch)} {env_prefix}-- "
+            f"{command} < /dev/null > {logpath} 2>&1 &\n"
+            f"echo $! > {pidfile}\n"
+        )
+        b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        launch_script = f"/tmp/chrootqemu-launch-{base}.sh"
+        launched = await self.vm.execute(
+            f"{sudo('bash -c \"echo %s | base64 -d > %s && bash %s && echo SPAWNED\"' % (b64, launch_script, launch_script))}",
+            timeout=30,
+        )
+        await self.vm.execute("sleep 3")
+        pid_read = await self.vm.execute(f"cat {pidfile} 2>/dev/null")
+        pid = pid_read.stdout.strip().splitlines()[-1] if pid_read.stdout.strip() else ""
+        alive = (
+            await self.vm.execute(f"{sudo(f'kill -0 {pid}')} >/dev/null 2>&1 && echo alive")
+            if pid
+            else None
+        )
+        started = launched.exit_code == 0 and alive is not None and "alive" in alive.stdout
+        log = await self.vm.execute(f"tail -n 25 {logpath} 2>/dev/null")
+        result = {
+            "started": started,
+            "stage": "running" if started else "launch_failed",
+            "workdir": workdir,
+            "qemu": qemu,
+            "pid": pid,
+            "log_tail": log.stdout[-2000:],
+            "mounts": mounts.stdout.strip()[:400],
+            "error": "" if started else f"process did not stay alive: {command}",
+        }
+        logger.info("chroot+qemu launch", arch=arch, started=started, workdir=workdir)
+        return result
+
+    async def chroot_cleanup(
+        self,
+        workdir: str,
+        process_match: str = "qemu-.*-static",
+        remove_workdir: bool = False,
+    ) -> dict:
+        """Stop the chrooted qemu process and unmount dev/pts/proc.
+
+        ``workdir`` is the chroot working copy created by
+        ``chroot_user_mode``. ``process_match`` is an extended-regex matched
+        against the command line of running processes (default: any
+        user-mode qemu). Returns ``{"unmounted": bool, "remaining": str}``.
+        """
+        workdir = (workdir or "").rstrip("/")
+        if not workdir or workdir == "/" or not workdir.startswith("/"):
+            return {"unmounted": False, "remaining": "refusing unsafe workdir path"}
+        password = settings.vm_ssh_password
+
+        await self.vm.execute(
+            f"echo '{password}' | sudo -S -p '' pkill -f '{process_match}' 2>/dev/null; sleep 1"
+        )
+        r = await self.vm.execute(
+            f"echo '{password}' | sudo -S -p '' bash -c "
+            f"'umount {workdir}/dev/pts 2>/dev/null; umount -l {workdir}/dev/pts 2>/dev/null; "
+            f"umount {workdir}/dev 2>/dev/null; umount -l {workdir}/dev 2>/dev/null; "
+            f"umount {workdir}/proc 2>/dev/null; umount -l {workdir}/proc 2>/dev/null; "
+            f"umount {workdir}/var/tmp 2>/dev/null; umount -l {workdir}/var/tmp 2>/dev/null; "
+            f"umount {workdir}/var/run 2>/dev/null; umount -l {workdir}/var/run 2>/dev/null; "
+            f"sleep 1; mount | grep -c {workdir} || true'"
+        )
+        remaining = r.stdout.strip()
+        unmounted = remaining == "0"
+        if unmounted and remove_workdir:
+            await self.vm.execute(
+                f"echo '{password}' | sudo -S -p '' rm -rf {workdir}"
+            )
+        logger.info("chroot+qemu cleanup", workdir=workdir, unmounted=unmounted, remaining=remaining)
+        return {"unmounted": unmounted, "remaining": remaining}
 
     async def detect_arch(self, rootfs_path: str) -> str | None:
         """Detect the architecture of a firmware rootfs by inspecting ELF headers."""
@@ -76,386 +351,3 @@ class EmulationManager:
             return "x86"
         logger.warning("unknown architecture", rootfs=rootfs_path, readelf_output=text[:200])
         return None
-
-    async def match_kernel(self, arch: str, rootfs_path: str = "") -> str | None:
-        """Return a kernel path for ``arch``.
-
-        Priority: 1) kernel embedded in the firmware rootfs (if given),
-        2) kernel manifest -- provisioning from FirmAE binaries or the pinned
-        registry URL if the file is missing. Never guesses filenames.
-        """
-        if rootfs_path:
-            result = await self.vm.execute(
-                f"find {rootfs_path} -name 'vmlinu*' -o -name 'zImage' "
-                f"-o -name 'bzImage' 2>/dev/null | head -1"
-            )
-            if result.exit_code == 0 and result.stdout.strip():
-                kernel_path = result.stdout.strip()
-                logger.info("found embedded kernel", path=kernel_path)
-                return kernel_path
-
-        return await kernel_assets.ensure_kernel(self.vm, arch)
-
-    async def load_boot_template(self, arch: str) -> dict:
-        """Load the per-arch boot template (creating defaults when missing).
-
-        Asset names are always overlaid from ``kernel_assets.BOOT_IMAGES`` so
-        the template points at exactly the files that get auto-provisioned.
-        """
-        path = settings.vm_qemu_boot_templates
-        result = await self.vm.execute(f"cat {path} 2>/dev/null || echo __MISSING__")
-        if "__MISSING__" in result.stdout:
-            await kernel_assets.ensure_boot_templates(self.vm)
-            result = await self.vm.execute(f"cat {path} 2>/dev/null || echo __MISSING__")
-        try:
-            templates = json.loads(result.stdout)
-            tmpl = templates.get(arch, {}) or {}
-        except (json.JSONDecodeError, ValueError):
-            logger.warning("boot templates unreadable", path=path)
-            tmpl = {}
-        for asset in kernel_assets.BOOT_IMAGES.get(arch, []):
-            if asset["role"] in ("kernel", "initrd", "disk"):
-                tmpl[asset["role"]] = asset["name"]
-        return tmpl
-
-    @staticmethod
-    def _full_path(name: str, base: str) -> str:
-        return name if name.startswith("/") else f"{base}/{name}"
-
-    async def start_qemu_system(
-        self, arch: str = "mips", kernel: str = "", disk_image: str = ""
-    ) -> dict:
-        """Boot via the per-arch template.
-
-        Returns ``{"started", "log", "error", "template", "command"}``.
-        """
-        # Auto-provision the boot images (kernel/disk) before booting.
-        images = await kernel_assets.ensure_boot_images(self.vm, arch, wait=False)
-        if not images.get("ready"):
-            return {
-                "started": False,
-                "stage": "provisioning",
-                "status": images,
-                "log": "",
-                "error": (
-                    f"boot images for {arch} are missing; they are downloading "
-                    f"in the background -- call "
-                    f"kernel_assets.ensure_boot_images(vm, '{arch}') (wait) or "
-                    f"boot_image_status() to check progress"
-                ),
-            }
-
-        tmpl = await self.load_boot_template(arch)
-        if not tmpl:
-            return {
-                "started": False,
-                "error": f"no boot template for {arch}",
-                "log": "",
-            }
-
-        kernel = kernel or self._full_path(
-            tmpl.get("kernel", ""), settings.vm_qemu_image_dir
-        )
-        disk_image = disk_image or self._full_path(
-            tmpl.get("disk", ""), settings.vm_qemu_image_dir
-        )
-        if not kernel or not disk_image:
-            return {
-                "started": False,
-                "error": f"template for {arch} is missing kernel/disk",
-                "log": "",
-                "template": tmpl,
-            }
-
-        initrd = (
-            self._full_path(tmpl["initrd"], settings.vm_qemu_image_dir)
-            if tmpl.get("initrd")
-            else None
-        )
-        result = await self.vm.run_qemu_system(
-            kernel=kernel,
-            disk_image=disk_image,
-            arch=arch,
-            machine=tmpl.get("machine"),
-            append=tmpl.get("append"),
-            initrd=initrd,
-            hostfwd=tmpl.get("hostfwd"),
-        )
-
-        # Give QEMU a moment, then verify the process is alive and grab the log
-        await self.vm.execute("sleep 8")
-        alive = await self.vm.execute("pgrep -f qemu-system >/dev/null 2>&1 && echo alive")
-        log = await self.vm.execute(f"tail -n 25 /tmp/qemu-{arch}.log 2>/dev/null")
-        started = result.exit_code == 0 and "alive" in alive.stdout
-        logger.info("qemu system start", arch=arch, started=started)
-        return {
-            "started": started,
-            "log": log.stdout[-2000:],
-            "error": "" if started else "qemu exited or failed to start (see log)",
-            "template": tmpl,
-            "command": f"kernel={kernel} disk={disk_image} machine={tmpl.get('machine', 'malta')}",
-        }
-
-    async def start_firmae(self, firmware_path: str, timeout_sec: int = 900) -> dict:
-        """Start FirmAE (init + run) in the background and wait for boot.
-
-        Returns ``{"started", "stage", "reason", "ip", "qemu_pid", "log_tail"}``.
-        """
-        firmae = settings.firmae_dir
-        cmd = (
-            f"cd {firmae} && (bash ./init.sh {firmware_path} "
-            f"&& bash ./run.sh -r {firmware_path}) "
-            f"< /dev/null > /tmp/firmae-run.log 2>&1 & echo started"
-        )
-        result = await self.vm.execute(cmd, timeout=30)
-        if result.exit_code != 0:
-            return {
-                "started": False,
-                "stage": "launch",
-                "reason": result.stderr[:300],
-                "log_tail": "",
-            }
-
-        await self.vm.execute("sleep 20")  # let init.sh extract before polling
-        return await self.wait_firmae_ready(timeout_sec=timeout_sec)
-
-    async def wait_firmae_ready(self, timeout_sec: int = 900) -> dict:
-        """Poll FirmAE logs until boot succeeds/fails or timeout."""
-        deadline = time.monotonic() + timeout_sec
-        last_tail = ""
-        ip = ""
-        while time.monotonic() < deadline:
-            log = await self.vm.execute("tail -n 40 /tmp/firmae-run.log 2>/dev/null")
-            last_tail = log.stdout[-2500:]
-            ip = await self._extract_firmae_ip()
-            qemu = await self.vm.execute("pgrep -f qemu-system | head -1")
-            qemu_pid = qemu.stdout.strip()
-
-            serial = await self.vm.execute(
-                "tail -n 60 $(ls -t /opt/firmae/scratch/*/qemu.initial.serial.log "
-                "2>/dev/null | head -1) 2>/dev/null"
-            )
-            serial_tail = serial.stdout[-3000:]
-            low_run = last_tail.lower()
-            low_serial = serial_tail.lower()
-
-            if any(m in low_serial for m in _BOOT_OK_MARKERS) or any(
-                m in low_run for m in _BOOT_OK_MARKERS
-            ):
-                logger.info("firmae boot detected", ip=ip or "unknown")
-                return {
-                    "started": True,
-                    "stage": "boot",
-                    "reason": "login/init marker found",
-                    "ip": ip,
-                    "qemu_pid": qemu_pid,
-                    "log_tail": (serial_tail or last_tail)[-2000:],
-                }
-
-            for marker in _BOOT_FAIL_MARKERS:
-                if marker in low_serial or marker in low_run:
-                    logger.warning("firmae boot failure detected", marker=marker)
-                    return {
-                        "started": False,
-                        "stage": "boot_failed",
-                        "reason": marker,
-                        "ip": ip,
-                        "qemu_pid": qemu_pid,
-                        "log_tail": (serial_tail or last_tail)[-2000:],
-                    }
-
-            await asyncio.sleep(15)
-
-        return {
-            "started": False,
-            "stage": "timeout",
-            "reason": f"no boot marker within {timeout_sec}s",
-            "ip": ip,
-            "log_tail": last_tail[-2000:],
-        }
-
-    async def _extract_firmae_ip(self) -> str:
-        """Grep the emulated device IP from FirmAE run/serial logs."""
-        result = await self.vm.execute(
-            "grep -rhoE 'inet addr:[0-9.]+|inet [0-9.]+|ip : [0-9.]+' "
-            "/tmp/firmae-run.log /opt/firmae/scratch/*/qemu.initial.serial.log "
-            "2>/dev/null | head -1"
-        )
-        m = re.search(r"([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)", result.stdout)
-        return m.group(1) if m else ""
-
-    async def chroot_launch(
-        self,
-        rootfs_path: str,
-        service: str = "",
-        arch: str = "mipsel",
-    ) -> dict:
-        """Prepare a chroot of the extracted rootfs and optionally run a service.
-
-        Steps:
-        1. Provision FirmAE runtime assets (busybox / libnvram / console).
-        2. Bind-mount /proc, /dev, /tmp into the rootfs (sudo).
-        3. Install the arch-matched libnvram.so into rootfs/lib if missing.
-        4. If ``service`` is given, launch it via ``chroot`` with
-           ``LD_PRELOAD=/lib/libnvram.so``.
-
-        Returns ``{"started", "stage", "rootfs", "nvram", "log_tail", "error"}``.
-        """
-        from iot_agent.tools import kernel_assets as ka
-
-        await ka.provision_runtime_assets(self.vm)
-        rootfs = rootfs_path.rstrip("/")
-        password = settings.vm_ssh_password
-        # NOTE: every SSH exec_command is its own session, so sudo's
-        # credential cache does NOT carry over -- pipe the password on
-        # each privileged command.
-        def sudo(cmd: str) -> str:
-            return f"echo '{password}' | sudo -S -p '' {cmd}"
-
-        # 1) cache sudo credentials
-        r = await self.vm.execute(f"{sudo('-v')} 2>/dev/null && echo SUDO_OK")
-        if "SUDO_OK" not in r.stdout:
-            return {
-                "started": False,
-                "stage": "sudo",
-                "rootfs": rootfs,
-                "error": "sudo credential check failed",
-                "log_tail": r.stderr[:300],
-            }
-
-        # 2) bind mounts
-        mount_script = (
-            f"for d in proc dev tmp; do [ -d {rootfs}/$d ] || {sudo(f'mkdir -p {rootfs}/$d')}; done; "
-            f"{sudo(f'mount -t proc /proc {rootfs}/proc')} 2>/dev/null || true; "
-            f"{sudo(f'mount -o bind /dev {rootfs}/dev')} 2>/dev/null || true; "
-            f"{sudo(f'mount -t tmpfs tmpfs {rootfs}/tmp')} 2>/dev/null || true; "
-            f"mount | grep {rootfs} | head -5"
-        )
-        mounts = await self.vm.execute(mount_script)
-
-        # 3) install libnvram for the architecture
-        nvram_name = ka.ARCH_RUNTIME.get(arch, {}).get("libnvram", "")
-        nvram_installed = ""
-        if nvram_name:
-            nvram_src = f"{ka.runtime_dir()}/{nvram_name}"
-            nvram_installed = f"{rootfs}/lib/libnvram.so"
-            await self.vm.execute(
-                f"cp -f {nvram_src} {rootfs}/lib/libnvram.so 2>/dev/null || true; "
-                f"cp -f {nvram_src} {rootfs}/lib/{nvram_name} 2>/dev/null || true"
-            )
-
-        result = {
-            "started": False,
-            "stage": "prepared",
-            "rootfs": rootfs,
-            "nvram": nvram_installed,
-            "mounts": mounts.stdout.strip()[:500],
-            "log_tail": "",
-            "error": "",
-        }
-
-        # 4) launch the target service (optional)
-        if service:
-            # The service string may itself contain paths (e.g. '> /tmp/x'),
-            # so derive a safe, unique filename from a hash instead of
-            # splitting on '/'.
-            base = hashlib.sha256(service.encode("utf-8")).hexdigest()[:12]
-            logpath = f"/tmp/chroot-{base}.log"
-            pidfile = f"{logpath}.pid"
-            launch_script = f"/tmp/chroot-launch-{base}.sh"
-            result["launch_mode"] = ""
-            for attempt, env_prefix in enumerate(
-                [
-                    "env PATH=/bin:/sbin:/usr/bin:/usr/sbin LD_PRELOAD=/lib/libnvram.so",
-                    "env PATH=/bin:/sbin:/usr/bin:/usr/sbin",
-                ]
-            ):
-                # Encode the launch script in base64: avoids quoting hell and
-                # detaches the background job so the SSH channel closes
-                # immediately. setsid puts the job in a new session (otherwise
-                # sshd kills the whole process group when the channel closes);
-                # in a non-interactive shell it execs without forking, so the
-                # recorded PID stays valid for kill -0.
-                script = (
-                    f"setsid nohup {env_prefix} chroot {rootfs} {service} "
-                    f"< /dev/null > {logpath} 2>&1 &\n"
-                    f"echo $! > {pidfile}\n"
-                )
-                b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
-                launch = (
-                    f"echo '{password}' | sudo -S -p '' bash -c "
-                    f"'echo {b64} | base64 -d > {launch_script} && "
-                    f"bash {launch_script} && echo SPAWNED'"
-                )
-                launched = await self.vm.execute(launch, timeout=30)
-                await self.vm.execute("sleep 3")
-                pid_read = await self.vm.execute(f"cat {pidfile} 2>/dev/null")
-                pid = pid_read.stdout.strip().splitlines()[-1] if pid_read.stdout.strip() else ""
-                # kill -0 probes the process; the service runs as root so the
-                # probe must also run as root (EPERM otherwise).
-                alive = await self.vm.execute(
-                    f"echo '{password}' | sudo -S -p '' kill -0 {pid} "
-                    f">/dev/null 2>&1 && echo alive"
-                ) if pid else None
-                if launched.exit_code == 0 and alive is not None and "alive" in alive.stdout:
-                    result["started"] = True
-                    result["stage"] = "service"
-                    result["launch_mode"] = "ld_preload" if attempt == 0 else "plain"
-                    result["pid"] = pid
-                    break
-                # Try once more without LD_PRELOAD before giving up
-            log = await self.vm.execute(f"tail -n 20 {logpath} 2>/dev/null")
-            result["log_tail"] = log.stdout[-1500:]
-            if not result["started"]:
-                result["stage"] = "service_failed"
-                result["error"] = f"service did not stay alive: {service}"
-            logger.info(
-                "chroot service launch",
-                arch=arch, service=service, started=result["started"],
-                mode=result["launch_mode"],
-            )
-        return result
-
-    async def chroot_cleanup(self, rootfs_path: str, service: str = "") -> dict:
-        """Stop the chroot service (if known) and unmount proc/dev/tmp.
-
-        Returns ``{"unmounted": bool, "remaining": str}``. A service still
-        running inside the chroot keeps the mounts busy, so it is killed
-        first (via the pid recorded at launch), then unmount is attempted
-        and falls back to a lazy unmount.
-        """
-        rootfs = rootfs_path.rstrip("/")
-        if not rootfs or rootfs == "/" or not rootfs.startswith("/"):
-            return {"unmounted": False, "remaining": "refusing unsafe rootfs path"}
-        password = settings.vm_ssh_password
-
-        if service:
-            base = hashlib.sha256(service.encode("utf-8")).hexdigest()[:12]
-            pidfile = f"/tmp/chroot-{base}.log.pid"
-            pid = (await self.vm.execute(f"cat {pidfile} 2>/dev/null")).stdout.strip()
-            if pid:
-                await self.vm.execute(
-                    f"echo '{password}' | sudo -S -p '' kill {pid} 2>/dev/null; sleep 1"
-                )
-
-        r = await self.vm.execute(
-            f"echo '{password}' | sudo -S -p '' bash -c "
-            f"'umount {rootfs}/proc 2>/dev/null; umount -l {rootfs}/proc 2>/dev/null; "
-            f"umount {rootfs}/dev 2>/dev/null; umount -l {rootfs}/dev 2>/dev/null; "
-            f"umount {rootfs}/tmp 2>/dev/null; umount -l {rootfs}/tmp 2>/dev/null; "
-            f"sleep 1; mount | grep -c {rootfs} || true'"
-        )
-        remaining = r.stdout.strip()
-        unmounted = remaining == "0"
-        logger.info("chroot cleanup", rootfs=rootfs, unmounted=unmounted, remaining=remaining)
-        return {"unmounted": unmounted, "remaining": remaining}
-
-    async def get_emulated_device_info(self) -> dict:
-        """Get info about the running emulated device."""
-        qemu = await self.vm.execute("ps aux | grep qemu-system | grep -v grep | head -1")
-        ip = await self._extract_firmae_ip()
-        return {
-            "running": bool(qemu.stdout.strip()),
-            "ip": ip,
-            "status": qemu.stdout.strip(),
-        }

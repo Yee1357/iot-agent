@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "iot-vuln-agent"
 version = "0.1.0"
-description = "IoT 固件漏洞挖掘 — IDA Pro (MCP/idalib) + QEMU VM 自动化分析管线"
+description = "IoT 固件漏洞挖掘 Agent — Claude Code 通过 MCP 工具链（VM SSH + IDA Pro）进行固件分析、二进制逆向、漏洞发现与动态验证（user-mode/chroot）"
 readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "MIT"}
@@ -20,6 +20,10 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "lxml>=5.0",
 ]
+
+
+
+
 
 [tool.setuptools.packages.find]
 where = ["src"]

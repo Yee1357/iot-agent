@@ -1,113 +1,111 @@
 ---
 name: iot-emulate-firmware
-description: QEMU 全系统模拟。在 VM 上用 FirmAE 或手动 QEMU 启动固件，验证漏洞。用户要求模拟固件、跑起来验证漏洞、复现攻击时使用。
+description: 固件动态验证。两级模式：qemu-user -L 快速试错（不作为最终结论）+ chroot 包裹 qemu 的正式验证（唯一 verdict 依据）。系统态模拟（FirmAE/QEMU system）已移除。用户要求验证漏洞、复现攻击时使用。
 argument-hint: "[firmware_model]"
 ---
 
-# QEMU 固件模拟 & 动态验证
-**所有操作在 VM 上完成。**
+# 固件动态验证（两级：试错 → chroot+qemu 验证）
 
-## 铁律：内核与镜像的来源
+**所有操作在 VM 上完成，工具一律走 MCP。**
 
-- **禁止自行搜索或猜测内核下载地址。** 内核一律来自清单 `/data/qemu-images/kernels/manifest.json`（由 `scripts/provision_kernels.py` 维护）。
-- 补齐内核（VM 上执行，幂等）：
-```bash
-python /path/to/scripts/provision_kernels.py --arch mipsel   # 或 --all
-```
-- QEMU 启动参数一律使用模板 `/data/qemu-images/boot-templates.json`（由 `EmulationManager.load_boot_template()` 读取），**不要手工拼 QEMU 命令行**。
+## 铁律
 
-## 方式一：FirmAE（优先）
+- **系统态模拟（FirmAE、手动 QEMU system mode）已从本项目移除**——不要尝试安装、不要拼 qemu-system 命令行。
+- 动态验证只有两级：
+  1. **快速试错** `iot_emulation_user_mode`（`qemu-<arch>-static -L <rootfs> <cmd>`）——便宜，但**结果不作为最终 verdict**（`-L` 只重定向 loader/库，guest 的绝对路径会落到 host 文件系统）
+  2. **正式验证** `iot_emulation_chroot_user_mode`（chroot 包裹 qemu）——**唯一可以作为动态 verdict 依据的路径**
+- binfmt 依赖的裸 chroot 方案已删除（chroot+qemu 完全覆盖且更真实、无 binfmt 依赖）。
 
-代码调用（推荐）：
-```python
-from iot_agent.tools.remote_vm import VMRemoteExecutor
-from iot_agent.tools.emulation_env import EmulationManager
+## 验证边界（铁律：只完整验证 A 级，B/C 级交用户）
 
-async with VMRemoteExecutor() as vm:
-    emu = EmulationManager(vm)
-    result = await emu.start_firmae("/data/firmware/xxx.bin")
-    # result: {started, stage, reason, ip, qemu_pid, log_tail}
-```
+**用户态模拟（chroot+qemu）只启动了一个进程视图——没有设备开机流程**：
+xmldb/NVRAM 运行时数据是空的、httpd/upnpd 等 daemon 不在、/proc 厂商文件缺失、
+网络事件不会进来。所以漏洞必须分级，**只对 A 级做完整验证**：
 
-- `start_firmae()` 会执行 init + run（`run.sh -r`）并在后台轮询启动日志，直到出现登录/init 标记、失败标记或超时。
-- **判断标准**：`result["started"] == True` 才算启动成功；失败时看 `result["stage"]`（launch / boot_failed / timeout）和 `result["reason"]`（kernel panic / no init / …），据此决定修复方向，不要盲目重试。
-- 设备 IP：`result["ip"]`；也可随时查 `emu.get_emulated_device_info()`。
+| 级别 | 定义 | 例子 | 处理 |
+|------|------|------|------|
+| **A 级** | 单进程内、输入→sink 直接可达，不依赖运行时数据/多进程/网络 | 命令注入直接 `system()`、栈溢出、文件操作、格式串 | **完整验证**（user-mode 或 chroot+qemu）→ 可 CONFIRMED |
+| **B 级** | 需补少量运行时数据（xmldb/NVRAM 节点）才能走完 | 本次 SSDP（`INF_getcurripaddr` 需接口数据）、经 NVRAM 的间接注入 | **不硬补**：静态证据 + 模拟走到哪一步，报告交用户决策 |
+| **C 级** | 依赖多进程协同/网络会话/内核接口 | 认证绕过链路、需要真实 HTTP 会话的 handler、ioctl 设备 | **不验证**：报告静态分析结论 + 建议（真机/系统态），交用户 |
 
-等价手动命令（调试 FirmAE 内部流程时才用）：
-```bash
-cd /opt/firmae && bash ./init.sh <firmware_path> && bash ./run.sh -r <firmware_path>
-```
+**B/C 级处理流程**（禁止无限尝试）：
+1. 最多 2 次环境尝试（止损规则）
+2. 输出结构化报告：静态证据链 + 模拟实际走到哪一步 + **缺失的环境** + 建议（补数据 / 真机复现 / 系统态模拟）
+3. 交用户决策，findings 保持 NEEDS_DYNAMIC，**notes 写明上述内容**（不是笼统的"需要动态验证"）
 
-## 方式二：手动 QEMU（FirmAE 失败后的兜底）
+**hunt 策略**：L2/L3 阶段优先筛选 A 级候选（输入直达 sink、无运行时依赖）；B/C 级候选正常给出静态 verdict 但标记级别，不投入动态验证时间。
 
-按模板启动，不要手拼参数：
-```python
-result = await emu.start_qemu_system(arch="mipsel")
-# {started, log, error, template, command}
-```
-- **镜像自动下载**：`start_qemu_system()` 启动前会自动检查 kernel/initrd/qcow2 是否就位，缺失即自动下载（内核等小文件同步下；约 270-290MB 的 qcow2 后台下载）。
-  - 显式等待/查进度：
-    ```python
-    from iot_agent.tools import kernel_assets
-    await kernel_assets.ensure_boot_images(vm, "mipsel")   # 阻塞直到就绪
-    status = await kernel_assets.boot_image_status(vm, "mipsel")  # 查进度
-    ```
-  - 返回 `stage="provisioning"` 表示镜像还在下载，不要重试启动，先轮询进度。
-- 模板里的 kernel/disk 是文件名，位于 `/data/qemu-images/`；来源为 aurel32 Debian 镜像（`people.debian.org/~aurel32/qemu/`），下载地址与架构映射见 `kernel_assets.BOOT_IMAGES`。
-- 启动后验证：`curl -v http://127.0.0.1:8080/`（hostfwd 端口来自模板）。
+## 前置：架构与 qemu 定位
 
-## 方式三：D-Link 固件一键系统态（推荐给 D-Link/类 D-Link）
-
-针对 D-Link 系固件（DIR-8xx 等），用现成脚本一条命令完成整套系统态：
-
-```bash
-python scripts/emulate_dlink.py --firmware /path/on/vm/fw.bin
-# 或直接给已解包的 rootfs：
-python scripts/emulate_dlink.py --rootfs /path/squashfs-root
+```text
+iot_emulation_detect_arch(rootfs)              # → "mipsel" 等，不要猜
+iot_emulation_ensure_qemu(arch)                # 定位 qemu：PATH → /usr/local/bin → find 兜底
+# found=True 拿到 path；found=False 时返回安装命令，走升级路径 L3 交用户决策
 ```
 
-脚本自动完成：下载 Debian 内核+镜像（缺失时）→ 建 tap0 网络 → 启动 qemu →
-注入 rootfs（httpd/htdocs/etc/uClibc 库）→ 启动 xmldb + dbload → 启动 httpd →
-验证 Web 界面与 HNAP 响应。状态与停止：
+## 方式一：快速试错（-L，10 秒级）
 
-```bash
-python scripts/emulate_dlink.py --status
-python scripts/emulate_dlink.py --stop
+```text
+iot_emulation_user_mode(rootfs_path=rootfs, command="./poc 'payload'", arch="mipsel")
+# → {started, exit_code, stdout, stderr, arch, qemu}
 ```
 
-**要点**：D-Link 的 httpd 是 Mathopd，动态页面（index.php/HNAP）依赖
-`xmldb` 守护进程（`/var/run/xmldb_sock`）——只起 httpd 会导致动态请求挂起，
-必须把固件 `usr/sbin/{xmldb,xmldbc,servd}` 传入 guest 并执行
-`xmldb -n <image_sign> -t` + `dbload.sh`。Web 端口默认 1234，guest IP
-192.168.100.2。
+**用途与限制**：
+- 适合：命令注入 sink 是否真的执行、文件是否存在、程序能否被 `-L` 拉起
+- **限制**：guest 内部绝对路径（`/etc`、`/tmp`、`/bin/sh`）落到 **host** 文件系统——`system()` 注入的副作用、写 pid 文件、读固件配置都是 host 的，不代表设备行为
+- **试错结果只能用于排除/初判，不能写进 verdict**。要下结论必须走方式二
 
-注入 rootfs 并启动服务（仅验证目标服务时最快）——用封装好的标准入口：
-```python
-res = await emu.chroot_launch(
-    rootfs_path="/data/extracted/<brand>/<model>_<ver>/rootfs",
-    service="/usr/sbin/httpd",
-    arch="mipsel",   # 由 readelf 判定，见 EmulationManager.detect_arch()
-)
-# res: {started, stage, launch_mode, pid, log_tail, error}
-# 结束记得清理：
-await emu.chroot_cleanup(rootfs_path="...", service="/usr/sbin/httpd")
+## 方式二：正式验证（chroot 包裹 qemu）
+
+```text
+iot_emulation_chroot_user_mode(rootfs_path="/data/extracted/<brand>/<model>_<ver>/rootfs",
+                               command="/usr/sbin/kworker --super 127.0.0.1 --port 7000 --config /etc/kworker.cfg",
+                               arch="mipsel",        # 来自 detect_arch
+                               inject_nvram=False)   # 程序读 NVRAM 时设 True（自动注入 libnvram）
+# → {started, stage, workdir, qemu, pid, log_tail, error}
 ```
 
-`chroot_launch()` 自动完成：挂载 proc/dev/tmp → 注入架构匹配的 `libnvram.so`（`LD_PRELOAD`）→ 后台启动服务 → 存活检测（失败会自动去掉 `LD_PRELOAD` 重试一次）。
+自动完成（参考实战验证脚本的成熟模式）：
+1. 定位 qemu（`/usr/local/bin` → PATH → find 兜底），缺失即报安装命令
+2. **工作副本**：`cp -a rootfs/. <rootfs>.chroot-qemu/`（幂等，只在缺失时重建）——**原始 rootfs 永不被污染**
+3. 复制 `qemu-<arch>-static` 到工作副本 `/usr/bin/`，bind mount `/dev` `/dev/pts` `/proc`
+4. 后台启动：`chroot <workdir> /usr/bin/qemu-<arch>-static [-E LD_PRELOAD=/lib/libnvram.so] -- <command>`
+   —— **qemu 进程本身被 chroot**，guest 的绝对路径、fork/exec 固件二进制（如 `/bin/sh`）全部在 rootfs 视图内，**且不依赖 binfmt_misc**
+5. 存活检测 + 日志回传
 
-## 验证策略（按成本排序）
+**为什么这是唯一正式验证**：程序读 `/etc/kworker.cfg`、写 `/var/run/kworker.pid`、`execve("/bin/sh")`（busybox）都在工作副本里发生——这就是设备真实视图，结果可直接当 verdict。
 
-1. **user-mode 优先**：`qemu-mipsel-static -L <rootfs>` 直接跑 PoC（命令注入类最快最稳）。
-2. **chroot 注入**：目标只是某个 CGI/守护进程时，chroot rootfs 起服务。
-3. **FirmAE 全系统**：需要完整网络栈/内核接口时。
-4. **手动 QEMU**：FirmAE 不可用时的兜底。
+**验证完必须清理**：
+```text
+iot_emulation_chroot_cleanup(workdir="<rootfs>.chroot-qemu", process_match="qemu-.*-static", remove_workdir=True)
+# 杀进程 + 卸载 dev/pts/proc + （可选）删除工作副本
+```
 
-## 模拟中常见问题
-- 固件需要的 NVRAM 配置缺失 → FirmAE 自动处理，手动时搜索 `/nvram` 相关初始化脚本
-- `/proc` 下缺少厂商内核模块注册的文件 → 可能导致特定守护进程 crash，判断是否影响目标服务
-- 非标准 web 架构（非 httpd + CGI）→ 可能需要逆向理解组件依赖关系
+## 典型验证流程（命令注入类）
+
+```text
+1. iot_emulation_detect_arch(rootfs) → arch
+2. iot_emulation_ensure_qemu(arch)   → 确认 qemu 在位
+3. iot_emulation_user_mode(rootfs, "echo PROBE; id", arch)   # 试错：sink 是否真执行
+4. iot_emulation_chroot_user_mode(rootfs, "<目标程序> <注入参数>", arch, inject_nvram=True)
+   # 正式验证：payload 在设备视图内执行
+5. 检查 log_tail 中 payload 的副作用（写文件/回连/输出），回填 verdict
+6. iot_emulation_chroot_cleanup(workdir, remove_workdir=True)
+```
+
+## 常见问题
+
+- 固件需要 NVRAM 配置 → `inject_nvram=True`（自动下载注入 libnvram.so + `-E LD_PRELOAD`）；仍报错则检查 `/proc` 厂商文件是否缺失（判断是否影响目标服务）
+- 程序需要交互/等待 → `timeout` 参数控制；`command` 里可带 shell 重定向（`> /tmp/out`）把副作用写进工作副本取证
+- qemu-user 不支持特定 syscall/段错误 → 记录原因，标 NEEDS_DYNAMIC（止损规则）
+- 工作副本很大 → 磁盘紧张时验证完立即 `remove_workdir=True` 清理
+- **`/tmp` 或 `/var/run` 写不进去（"can't create"）** → 固件 /tmp 通常是 symlink→/var/tmp 且 /var/run 不存在（设备上 /var 是 tmpfs），chroot 必须挂 tmpfs（工具已自动处理；手动排查时 `ls -ld <workdir>/var/tmp <workdir>/var/run` 确认）
+- **`-L` 模式跑 guest 程序报 "Invalid ELF image"** → `-L` 只重定向 guest 内部 open，**程序路径本身是 host 路径**，必须写完整 host 路径（`qemu-mipsel-static -L <rootfs> <rootfs>/bin/sh ...`）；chroot 模式无此问题
+- **VM 诊断命令静默失败** → VM 默认 shell 可能是 zsh：`echo ===XXX===` 触发 `=command` 展开报错、含单引号的命令嵌套 `bash -c '...'` 会截断。**VM 上跑多段命令统一用 base64 编码执行**（`echo <b64> | base64 -d | bash`），这是项目已验证的稳法
+- **固件 daemon 需要运行时数据**（xmldb/NVRAM）→ 属 B 级，按验证边界处理，不硬补
 
 ## 取舍原则
+
 - **值得修**：成本低，不修就完全不能跑
 - **值得绕过**：有替代路径达到验证目的
 - **不值得修**：与漏洞验证无关的环境问题

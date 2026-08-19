@@ -121,10 +121,6 @@ class VMRemoteExecutor:
     def _firmware_dir(self) -> str:
         return settings.vm_firmware_dir
 
-    @property
-    def _qemu_image_dir(self) -> str:
-        return settings.vm_qemu_image_dir
-
     # -- command execution ---------------------------------------------------
 
     async def is_available(self) -> bool:
@@ -223,14 +219,12 @@ class VMRemoteExecutor:
 
     async def check_tools(self) -> dict[str, bool]:
         """Check which analysis tools are installed on the VM."""
-        tools = ["binwalk", "qemu-system-mips", "qemu-system-arm",
-                 "python3", "firmae"]
+        tools = ["binwalk", "radare2",
+                 "qemu-mips-static", "qemu-mipsel-static", "qemu-arm-static",
+                 "python3"]
         checks = []
         for t in tools:
-            if t == "firmae":
-                checks.append(f"test -d /opt/firmae && echo 'firmae:ok' || echo 'firmae:fail'")
-            else:
-                checks.append(f"which {t} >/dev/null 2>&1 && echo '{t}:ok' || echo '{t}:fail'")
+            checks.append(f"which {t} >/dev/null 2>&1 && echo '{t}:ok' || echo '{t}:fail'")
         r = await self.execute("; ".join(checks))
         statuses = {t: False for t in tools}
         for line in r.stdout.splitlines():
@@ -244,49 +238,6 @@ class VMRemoteExecutor:
         """Extract firmware with binwalk."""
         cmd = f"mkdir -p {output_dir} && cd {output_dir} && binwalk -Me {firmware_path} 2>&1"
         return await self.execute(cmd, timeout=600)
-
-    async def run_qemu_system(
-        self,
-        kernel: str,
-        disk_image: str,
-        arch: str = "mips",
-        machine: str | None = None,
-        append: str = "root=/dev/sda1 console=ttyS0",
-        initrd: str | None = None,
-        hostfwd: str | None = None,
-        snapshot: bool = True,
-    ) -> RemoteResult:
-        """Start QEMU system emulation with a real disk image.
-
-        ``disk_image`` must be a QEMU disk image (qcow2/raw), NOT an extracted
-        rootfs directory -- ``-hda`` only accepts block device images.
-        Parameters not provided default from the per-arch boot templates
-        (see EmulationManager.load_boot_template).
-        """
-        qemu_bin = {
-            "mips": "qemu-system-mips", "mipsel": "qemu-system-mipsel",
-            "arm": "qemu-system-arm", "aarch64": "qemu-system-aarch64",
-        }.get(arch, "qemu-system-mips")
-
-        machine = machine or {
-            "mips": "malta", "mipsel": "malta",
-            "arm": "versatilepb", "aarch64": "virt",
-        }.get(arch, "malta")
-
-        netdev = "-netdev user,id=net0"
-        if hostfwd:
-            netdev += f",hostfwd={hostfwd}"
-        netdev += " -device e1000,netdev=net0"
-
-        initrd_part = f"-initrd {initrd} " if initrd else ""
-        snapshot_part = "-snapshot " if snapshot else ""
-        cmd = (
-            f"nohup {qemu_bin} -M {machine} -kernel {kernel} "
-            f"{initrd_part}-hda {disk_image} -append '{append}' "
-            f"{netdev} {snapshot_part}-nographic "
-            f"< /dev/null > /tmp/qemu-{arch}.log 2>&1 & echo 'started'"
-        )
-        return await self.execute(cmd, timeout=30)
 
     async def check_firmware_integrity(self, path: str, md5: str = "") -> bool:
         """Verify firmware file exists (and optionally hash)."""

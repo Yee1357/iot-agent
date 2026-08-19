@@ -31,10 +31,9 @@ class Settings(BaseSettings):
     vm_ssh_password: str = ""
     vm_ssh_key_path: str = ""
     vm_firmware_dir: str = "/data/firmware"
-    vm_qemu_image_dir: str = "/data/qemu-images"
-    vm_kernels_dir: str = "/data/qemu-images/kernels"
-    vm_qemu_boot_templates: str = "/data/qemu-images/boot-templates.json"
-    firmae_dir: str = "/opt/firmae"
+    #: Chroot runtime assets (busybox / libnvram / console) for single-service
+    #: dynamic verification. Full-system emulation assets were removed.
+    vm_runtime_dir: str = "/data/runtime-assets"
     #: Optional GitHub download mirror (e.g. "https://ghproxy.net/") for
     #: regions where github.com release downloads are slow. Empty = direct.
     download_mirror: str = ""
