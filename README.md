@@ -36,8 +36,7 @@ cp .env.example .env   # 编辑填入 VM 和 IDA 配置
     "iot-agent": {
       "type": "stdio",
       "command": "python",
-      "args": ["-m", "iot_agent.mcp_server"],
-      "cwd": "D:\\code\\iot-agent"
+      "args": ["-m", "iot_agent.mcp_server"]
     }
   }
 }
@@ -45,6 +44,7 @@ cp .env.example .env   # 编辑填入 VM 和 IDA 配置
 
 - **首次使用**：在项目目录运行 `claude`，首次启动会提示批准 `iot-agent` server——批准后每次启动自动加载，工具自动暴露给 LLM（无需任何开关）
 - **`python` 必须是 conda `iot-agent` 环境的解释器**（否则缺 `mcp` 模块，server 静默失败、工具不出现）。若 `python` 不在 PATH，把 `command` 换成绝对路径（如 `D:\anaconda3\envs\iot-agent\python.exe`）
+- 工作目录默认是项目根（无需 `cwd` 字段；如需指定可自行添加）
 - **验证**：`claude mcp list` 应显示 `iot-agent: ✓ Connected`；若 ✘ 或 Pending，按上面排查
 - **IDA 反编译**：`ida-pro-mcp` 走用户级配置（`claude mcp add` 已注册的 stdio 版，IDA 自带 python 跑插件），不在项目 `.mcp.json` 里重复注册，避免 scope 冲突；无 GUI 时用 `iot_ida_headless_scan`
 

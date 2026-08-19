@@ -4,7 +4,6 @@
       "type": "stdio",
       "command": "python",
       "args": ["-m", "iot_agent.mcp_server"],
-      "cwd": "D:\\code\\iot-agent",
       "env": {
         "PYTHONIOENCODING": "utf-8"
       }
