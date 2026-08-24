@@ -43,6 +43,7 @@
 | 文件 | 厂商 | 内容 |
 |------|------|------|
 | `dlink.json` | D-Link | xmldbc 命令注入 wrapper（lxmldbc_system / xmldbc_ephp / xmldbc_ephp_wb）+ CGI 参数 getter（cgibin_parse_request / sobj_get_string） |
+| `tenda.json` | Tenda | libcommon.so 命令注入 wrapper（doSystemCmd：内部 vsnprintf→system）+ CGI 参数 getter（websGetVar，xref 极多） |
 
 ## 跨厂商共性观察（按厂商文件割裂的知识在这里补回横向规律）
 
@@ -51,8 +52,8 @@
 
 | 共性 | 说明 | 涉及厂商 |
 |------|------|---------|
-| 私有"命令执行 wrapper" | 不直接调 `system()`，而是经厂商封装（如 xmldbc 系）。发现模式：`strings <bin> \| grep -i system` + 反编译查 `system()` 的上层调用者 | D-Link（xmldbc）；其他厂商常见 `xxx_system_cmd` / `do_cmd` / `run_cmd` 命名 |
-| 私有 CGI 参数 getter | `getenv` 之外，厂商常封装参数解析（D-Link `sobj_get_string`）。L2 初筛时对 taint source 名单做厂商补充 | D-Link；常见命名 `*_get_string` / `*_parse_request` |
+| 私有"命令执行 wrapper" | 不直接调 `system()`，而是经厂商封装（如 xmldbc 系）。发现模式：`strings <bin> \| grep -i system` + 反编译查 `system()` 的上层调用者 | D-Link（xmldbc）；Tenda（libcommon.so `doSystemCmd`）；其他厂商常见 `xxx_system_cmd` / `do_cmd` / `run_cmd` 命名 |
+| 私有 CGI 参数 getter | `getenv` 之外，厂商常封装参数解析（D-Link `sobj_get_string`）。L2 初筛时对 taint source 名单做厂商补充 | D-Link（sobj_get_string）；Tenda（websGetVar）；常见命名 `*_get_string` / `*_parse_request` |
 | 参数经 NVRAM 间接注入 | web 写配置 → NVRAM → 特权进程读取执行，sink 与 source 跨函数甚至跨进程 | 多家路由器厂商 |
 | 硬编码后门 / 认证绕过 | `strcmp(passwd, "hardcoded")`、cookie 后门，跨厂商普遍 | 多家 |
 

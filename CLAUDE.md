@@ -148,6 +148,12 @@
 chroot+qemu 验证完 → iot_emulation_chroot_cleanup(workdir, remove_workdir=True)（杀进程+卸载+删工作副本）
 ```
 
+## 报告与经验质量规范
+
+- **报告/经验中禁止出现机器特定路径**：本机绝对路径、用户名、`/home/xxx`、`C:\Users\xxx`、桌面等一律不进报告与经验库。统一用约定路径或占位——rootfs 写 `/data/extracted/<brand>/<model>_<ver>/rootfs`，本地 ELF 写 `elfs/<binary>`，VM 日志写 `/tmp/xxx.log`。原因：报告会被 `iot_experience_ingest_report` 消化成经验、跨会话复用，隐私路径会误导后续 hunt（如把分析机路径当目标路径）。
+- **经验库只沉淀可复用知识**（模式 / 验证技巧 / 误报规律 / 环境坑的通用解法）。一次性信息（本机路径、登录凭据、单次环境细节）不入库；已有条目含此类信息时用 `iot_experience_record` 刷新为干净表述。
+- **报告落盘前自查**路径与名称；`iot_experience_ingest_report` 入库后抽查 `detail`，发现隐私信息立即刷新或删除。
+
 ## 常用工具速查（MCP）
 
 | 工具 | 用途 |
