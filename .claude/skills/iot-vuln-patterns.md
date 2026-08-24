@@ -289,7 +289,7 @@ web 请求 → CGI handler → sobj_get_string() 提取参数
 | 代码模式 | 动作 |
 |---------|------|
 | `getenv("HTTP_*")` 后接 `system`/`sprintf` | 高优先级深入 |
-| `gets(buf)` | 直接 CONFIRMED |
+| `gets(buf)` | 高优先级深入（仍需 L3 数据流判定 + L4 A 级动态验证后才可 CONFIRMED） |
 | `sprintf(buf, user_input)` 且 buf 是栈变量 | 高优先级深入 |
 | `nvram_get` → `system` | 检查 NVRAM 是否 web 可写 |
 | `strcmp(passwd, "hardcoded")` | 检查是否认证绕过后门 |

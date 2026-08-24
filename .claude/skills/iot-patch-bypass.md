@@ -32,9 +32,10 @@ iot_firmware_extract("/data/firmware/<vendor>/<model>_<version>.bin", brand=...,
 
 ### Step 4：定位修补位置
 
-**IDA Pro MCP 方法（推荐）**：
+**反编译对比（推荐）**：
 
-分别加载新旧两个 binary → `decompile` 漏洞函数 → 逐行对比伪代码差异。
+- **有 IDA GUI**：`ida-pro-mcp` 分别加载新旧两个 binary → `decompile` 漏洞函数 → 逐行对比伪代码差异
+- **无 GUI**：`iot_vm_download(remote, "elfs/<binary>")` 拉取两个版本 → `iot_ida_headless_scan("elfs/<binary>", vendor=...)` 定位候选 → headless `decompile` 关注函数逐行对比
 
 **VM radare2 辅助**：
 ```bash

@@ -58,10 +58,14 @@ argument-hint: "[known_model] [vuln_description]"
 ```
 | 型号 | 是否存在漏洞函数 | 差异描述 | 验证状态 |
 |------|-----------------|---------|---------|
-| DIR-645 | 存在，代码一致 | 无差异 | CONFIRMED |
-| DIR-815 | 存在，代码一致 | 无差异 | CONFIRMED |
-| DIR-860L | 存在，有差异 | system() 调用前增加了白名单检查 | DISPROVED |
+| DIR-645 | 存在，代码一致 | 无差异 | 待 L4 验证 |
+| DIR-815 | 存在，代码一致 | 无差异 | 待 L4 验证 |
+| DIR-860L | 存在，有差异 | system() 调用前增加了白名单检查 | 疑似 DISPROVED（静态判定） |
 ```
+
+> **铁律：静态比对 ≠ verdict**。代码一致只说明"疑似受影响"——CONFIRMED 必须经
+> `iot-emulate-firmware` 两级动态验证（选 1-2 个代表型号验证）；DISPROVED 只在
+> 静态证据充分（有效过滤/不可达）时给出。上表是结构示例，不是结论模板。
 
 **经验沉淀**：跨型号比对发现的可复用模式（如"某函数在所有型号都无过滤"）记录到 `iot_experience_record(category="pattern", ...)`。
 
