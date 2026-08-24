@@ -26,7 +26,9 @@
 
 ```
 [L1] 攻击面识别（VM）
-  工具: iot_firmware_extract / iot_firmware_search_and_download；iot_vm_execute 查型号/版本/攻击面
+  工具: WebSearch/WebFetch 找官方固件直链（优先厂商官网，避免社区第三方镜像）
+       → iot_firmware_extract(url, brand, model, version) 下载并解包
+       → iot_vm_execute 查型号/版本/攻击面
   产出: rootfs 路径 + 攻击面清单（CGI / httpd / 网络守护进程）+ ELF 架构（iot_emulation_detect_arch）
   进入 L2 条件: 拿到 rootfs 和攻击面清单
 
@@ -151,7 +153,7 @@ chroot+qemu 验证完 → iot_emulation_chroot_cleanup(workdir, remove_workdir=T
 | 工具 | 用途 |
 |------|------|
 | `iot_vm_execute` / `iot_vm_upload` / `iot_vm_download` | VM shell / 文件传输（连接池复用） |
-| `iot_firmware_search` / `iot_firmware_search_and_download` / `iot_firmware_extract` | 固件搜索/下载/解包 |
+| `iot_firmware_extract` / `iot_firmware_list_cached` | 固件下载/解包（URL 由 agent 用 WebSearch 找）/ 缓存查询 |
 | `iot_emulation_detect_arch` / `iot_emulation_ensure_qemu` / `iot_emulation_user_mode` / `iot_emulation_chroot_user_mode` / `iot_emulation_chroot_cleanup` | L4 动态验证（试错 + chroot+qemu 验证） |
 | `iot_analysis_create_task` / `iot_analysis_add_finding` / `iot_analysis_mark_level` / `iot_analysis_update_finding` / `iot_analysis_resume_task` / `iot_analysis_insights` | 进度与结果持久化 + 历史 verdict 洞察 |
 | `iot_experience_record` / `iot_experience_load` / `iot_experience_bump` / `iot_experience_ingest_report` / `iot_experience_export_markdown` | 经验记忆（记录/加载/反馈/报告消化/固化导出） |

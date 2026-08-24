@@ -36,9 +36,7 @@ argument-hint: "[firmware|binary|report]"
 - `iot_vm_upload(local, remote)` / `iot_vm_download(remote, local)` — SFTP 传文件
 
 ### 固件
-- `iot_firmware_search(vendor, model)` — 多源搜索（OpenWrt/TP-Link/GitHub）
-- `iot_firmware_search_and_download(vendor, model)` — 搜索→下载→解包一步到位
-- `iot_firmware_extract(path, brand, model, version)` — 直接解包，返回 rootfs 路径
+- `iot_firmware_extract(url_or_path, brand, model, version)` — 下载（URL）+ 解包，返回 rootfs 路径。URL 由 agent 用 WebSearch/WebFetch 找官方直链
 - `iot_firmware_list_cached(...)` / `iot_firmware_cache_stats()` / `iot_firmware_cache_status()` — 缓存查询
 
 ### 动态验证（L4，两级：试错 → chroot+qemu 验证）

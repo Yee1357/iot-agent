@@ -21,8 +21,6 @@ class Settings(BaseSettings):
 
     # --- IDA Pro ---
     ida_install_dir: str = ""
-    ida_mcp_url: str = "http://127.0.0.1:13337/mcp"
-    ida_mcp_timeout: int = 60
 
     # --- Linux VM (optional remote execution) ---
     vm_ssh_host: str = ""

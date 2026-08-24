@@ -1,14 +1,14 @@
 """Chroot runtime assets for single-service dynamic verification on the VM.
 
-These small FirmAE binaries (busybox / libnvram / console, ~8 MB total) are
-the ONLY surviving assets of the former system-emulation stack: they let
-``EmulationManager.chroot_launch()`` inject an arch-matched ``libnvram.so``
-and a shell into an extracted rootfs so a single CGI/daemon can run without
-a full system image.
+Only the NVRAM shim survives of the former FirmAE asset set: it lets
+``EmulationManager.chroot_user_mode(inject_nvram=True)`` preload an
+arch-matched ``libnvram.so`` into a chrooted qemu-user process so a single
+CGI/daemon can read NVRAM values without a full system image.
 
 Full-system emulation (FirmAE, manual QEMU system mode, kernels, boot
-templates) was deliberately removed -- see ``emulation_env.py`` for the
-design rationale. Provisioning here is idempotent and mirror-aware.
+templates, busybox/console shims) was deliberately removed — see
+``emulation_env.py`` for the design rationale. Provisioning here is
+idempotent and mirror-aware.
 """
 
 from __future__ import annotations
@@ -25,22 +25,9 @@ from iot_agent.tools.remote_vm import VMRemoteExecutor
 logger = structlog.get_logger(__name__)
 
 
-#: FirmAE runtime binaries used for chroot injection and NVRAM simulation
-#: when booting extracted-rootfs services directly. All from the
+#: NVRAM shim binaries used for chroot injection. All from the
 #: pr0v3rbs/FirmAE release v1.0 (verified via GitHub API 2026-07-31).
 RUNTIME_ASSETS: dict[str, dict[str, Any]] = {
-    "busybox.mipseb": {
-        "url": "https://github.com/pr0v3rbs/FirmAE/releases/download/v1.0/busybox.mipseb",
-        "size": 1554032,
-    },
-    "busybox.mipsel": {
-        "url": "https://github.com/pr0v3rbs/FirmAE/releases/download/v1.0/busybox.mipsel",
-        "size": 1552668,
-    },
-    "busybox.armel": {
-        "url": "https://github.com/pr0v3rbs/FirmAE/releases/download/v1.0/busybox.armel",
-        "size": 1136104,
-    },
     "libnvram.so.mipseb": {
         "url": "https://github.com/pr0v3rbs/FirmAE/releases/download/v1.0/libnvram.so.mipseb",
         "size": 37416,
@@ -53,37 +40,13 @@ RUNTIME_ASSETS: dict[str, dict[str, Any]] = {
         "url": "https://github.com/pr0v3rbs/FirmAE/releases/download/v1.0/libnvram.so.armel",
         "size": 33872,
     },
-    "libnvram_ioctl.so.mipseb": {
-        "url": "https://github.com/pr0v3rbs/FirmAE/releases/download/v1.0/libnvram_ioctl.so.mipseb",
-        "size": 37968,
-    },
-    "libnvram_ioctl.so.mipsel": {
-        "url": "https://github.com/pr0v3rbs/FirmAE/releases/download/v1.0/libnvram_ioctl.so.mipsel",
-        "size": 37968,
-    },
-    "libnvram_ioctl.so.armel": {
-        "url": "https://github.com/pr0v3rbs/FirmAE/releases/download/v1.0/libnvram_ioctl.so.armel",
-        "size": 34768,
-    },
-    "console.mipseb": {
-        "url": "https://github.com/pr0v3rbs/FirmAE/releases/download/v1.0/console.mipseb",
-        "size": 130720,
-    },
-    "console.mipsel": {
-        "url": "https://github.com/pr0v3rbs/FirmAE/releases/download/v1.0/console.mipsel",
-        "size": 129824,
-    },
-    "console.armel": {
-        "url": "https://github.com/pr0v3rbs/FirmAE/releases/download/v1.0/console.armel",
-        "size": 131304,
-    },
 }
 
 #: arch -> runtime asset names
 ARCH_RUNTIME: dict[str, dict[str, str]] = {
-    "mips": {"busybox": "busybox.mipseb", "libnvram": "libnvram.so.mipseb", "libnvram_ioctl": "libnvram_ioctl.so.mipseb"},
-    "mipsel": {"busybox": "busybox.mipsel", "libnvram": "libnvram.so.mipsel", "libnvram_ioctl": "libnvram_ioctl.so.mipsel"},
-    "arm": {"busybox": "busybox.armel", "libnvram": "libnvram.so.armel", "libnvram_ioctl": "libnvram_ioctl.so.armel"},
+    "mips": {"libnvram": "libnvram.so.mipseb"},
+    "mipsel": {"libnvram": "libnvram.so.mipsel"},
+    "arm": {"libnvram": "libnvram.so.armel"},
 }
 
 

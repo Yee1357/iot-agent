@@ -72,8 +72,7 @@ iot-agent/
 │   ├── mcp_server.py             # MCP server（工具唯一入口，SSH 连接池）
 │   └── tools/
 │       ├── remote_vm.py          # VM SSH 远程执行（连接复用）
-│       ├── firmware_acquire.py   # 固件下载 + extract() 标准化解包
-│       ├── firmware_sources.py   # 多源固件搜索（OpenWrt/TP-Link/GitHub）
+│       ├── firmware_acquire.py   # 固件下载（URL 由 agent WebSearch 找）+ extract() 标准化解包
 │       ├── firmware_index.py     # 固件本地 SQLite 索引缓存
 │       ├── ida_mcp.py            # IDAHeadlessClient + MCP Client
 │       ├── ida_scanner.py        # IDA headless 扫描器（两轮筛选）

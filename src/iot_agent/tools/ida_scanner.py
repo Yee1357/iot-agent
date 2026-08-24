@@ -1,10 +1,11 @@
-"""IDA binary analysis — scanner + analysis helpers.
+"""IDA binary analysis — headless scanner + analysis helpers.
 
-Provides IDAHeadlessScanner (primary, runs on headless IDA) and
-IDASystematicScanner (optional, runs on MCP). Both produce
-VulnerabilityFinding lists for AI consumption.
+Provides ``IDAHeadlessScanner`` (primary, runs on headless IDA via idalib),
+producing ``VulnerabilityFinding`` lists for AI consumption. The optional
+MCP-based scanner (``IDASystematicScanner``) was removed — the GUI path is
+covered by the external ``ida-pro-mcp`` server.
 
-Vendor neutrality: the scanners contain ONLY generic sink/source lists.
+Vendor neutrality: the scanner contains ONLY generic sink/source lists.
 Vendor-specific sinks / taint sources live in the ``knowledge/`` directory
 (project root, one JSON per vendor) and are merged at runtime when a
 ``vendor`` argument is given -- see ``load_vendor_knowledge``.
@@ -24,7 +25,6 @@ import structlog
 
 from iot_agent.tools.ida_mcp import (
     IDAHeadlessClient,
-    IDAMCPClient,
     VulnerabilityFinding,
 )
 
@@ -597,148 +597,4 @@ class IDAHeadlessScanner:
         logger.info("headless scan complete",
                      total=len(findings),
                      high_risk=sum(1 for f in findings if f.confidence >= 0.5))
-        return findings
-
-
-# ---------------------------------------------------------------------------
-# IDASystematicScanner — MCP-based scanner (optional, for interactive use)
-# ---------------------------------------------------------------------------
-
-
-class IDASystematicScanner:
-    """High-level scanner using IDA MCP (optional, for interactive use).
-
-    Prefer IDAHeadlessScanner for batch analysis.
-    """
-
-    def __init__(self, client: IDAMCPClient, vendor: str = ""):
-        self.client = client
-        self.vendor = vendor
-        (
-            self.sinks,
-            self.taint_sources,
-            self.sink_classification,
-            self.format_string_sinks,
-        ) = _merge_vendor_knowledge(vendor)
-
-    async def get_all_entrypoints(self) -> list[dict]:
-        """Return all CGI handlers / exported functions that process input."""
-        survey = await self.client.survey_binary()
-        eps = survey.get("entrypoints", [])
-        if not eps:
-            r = await self.client.call_tool("entity_query", {
-                "queries": [{"kind": "functions", "filter": "*main*"}]
-            })
-            eps = r if isinstance(r, list) else []
-        return eps
-
-    async def find_dangerous_calls(self) -> list[dict]:
-        """Scan all dangerous import calls and return their callers."""
-        results: list[dict] = []
-        import_data = await self.client.imports_query(self.sinks)
-
-        import_map: dict[str, dict] = {}
-        for entry in import_data:
-            if not isinstance(entry, dict):
-                continue
-            for imp in entry.get("data", []):
-                if isinstance(imp, dict) and imp.get("addr"):
-                    import_map[imp["addr"]] = imp
-
-        all_addrs = list(import_map.keys())
-        if not all_addrs:
-            return results
-
-        try:
-            xrefs_data = await self.client.xrefs_to(all_addrs)
-        except Exception:
-            logger.warning("xrefs query failed in MCP scan", addr_count=len(all_addrs), exc_info=True)
-            return results
-
-        for entry in (xrefs_data if isinstance(xrefs_data, list) else []):
-            if not isinstance(entry, dict):
-                continue
-            imp_addr = entry.get("addr", "")
-            imp = import_map.get(imp_addr) or import_map.get(str(imp_addr))
-            if not imp:
-                continue
-            for xr in entry.get("xrefs", []):
-                if not isinstance(xr, dict):
-                    continue
-                if xr.get("type") != "code":
-                    continue
-                fn = xr.get("fn") or {}
-                results.append({
-                    "dangerous_func": imp.get("imported_name", ""),
-                    "import_addr": imp_addr,
-                    "caller_addr": xr.get("addr"),
-                    "caller_name": fn.get("name", "unknown"),
-                })
-        return results
-
-    async def systematic_vuln_scan(self) -> list[VulnerabilityFinding]:
-        """Systematic scan via MCP — same logic as IDAHeadlessScanner but async."""
-        dangerous_calls = await self.find_dangerous_calls()
-        logger.info("dangerous calls found", count=len(dangerous_calls))
-
-        seen: set[str] = set()
-        unique: list[dict] = []
-        for dc in dangerous_calls:
-            key = f"{dc['caller_name']}:{dc['dangerous_func']}"
-            if key not in seen:
-                seen.add(key)
-                unique.append(dc)
-
-        logger.info("unique caller-sink pairs", count=len(unique))
-
-        findings: list[VulnerabilityFinding] = []
-        for dc in unique:
-            sink = dc["dangerous_func"]
-            caller = dc["caller_name"]
-            caller_addr = dc["caller_addr"]
-            cwe, desc, severity, confidence = self.sink_classification.get(sink, _SINK_DEFAULT)
-            title = f"{sink}() call in {caller}" + (f" — {desc}" if desc else "")
-            findings.append(VulnerabilityFinding(
-                title=title,
-                severity=severity,
-                cwe_id=cwe,
-                vulnerable_function=caller,
-                vulnerable_address=str(caller_addr),
-                source_sink_path=f"{sink} @ {dc['caller_addr']}",
-                confidence=confidence,
-            ))
-
-        # For top-risk functions, decompile to verify
-        high_risk = [f for f in findings if f.confidence >= 0.5]
-        for f in high_risk[:20]:
-            try:
-                code = await self.client.decompile(f.vulnerable_address)
-                full_code = str(code)
-
-                # Use analysis helpers for context extraction
-                f.decompiled_code = extract_sink_context(full_code, f.cwe_id.split()[-1] if " " in f.cwe_id else "", context_lines=8)
-
-                # Check hardcoded
-                sink_name = f.title.split("(")[0]
-                if is_hardcoded_arg(full_code, sink_name, self.format_string_sinks):
-                    f.confidence = 0.1
-                    f.severity = "LOW"
-                    continue
-
-                # Trace taint
-                taint_info = trace_arg_source(
-                    full_code, sink_name,
-                    taint_sources=self.taint_sources,
-                    format_string_sinks=self.format_string_sinks,
-                )
-                if taint_info["is_tainted"]:
-                    f.confidence = min(f.confidence + 0.2, 1.0)
-                    f.severity = "CRITICAL" if f.confidence > 0.7 else "HIGH"
-            except Exception:
-                logger.warning("MCP decompile/analyze failed, skipping",
-                               caller=caller, addr=caller_addr, exc_info=True)
-
-        findings.sort(key=lambda f: f.confidence, reverse=True)
-        logger.info("systematic scan complete", total=len(findings),
-                     high_risk=len(high_risk))
         return findings

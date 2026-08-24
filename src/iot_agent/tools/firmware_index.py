@@ -24,21 +24,27 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
+#: project root (``src/iot_agent/tools/...`` -> repo root) -- DB paths must
+#: not depend on the process CWD, the MCP server may start from anywhere.
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
 
 class FirmwareIndex:
     """SQLite-backed firmware metadata index."""
 
-    def __init__(self, db_path: str = "./data/firmware_index.db") -> None:
-        self._db_path = Path(db_path)
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, db_path: str = "") -> None:
+        self._db_path = Path(db_path) if db_path else _PROJECT_ROOT / "data" / "firmware_index.db"
         self._conn: sqlite3.Connection | None = None
         self._init_db()
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
-            self._conn = sqlite3.connect(str(self._db_path))
+            self._conn = sqlite3.connect(
+                str(self._db_path), timeout=10, check_same_thread=False
+            )
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=10000")
         return self._conn
 
     def _init_db(self) -> None:
@@ -153,14 +159,6 @@ class FirmwareIndex:
         conn = self._get_conn()
         row = conn.execute(
             "SELECT * FROM firmware WHERE url = ?", (url,)
-        ).fetchone()
-        return dict(row) if row else None
-
-    def find_by_hash(self, file_hash: str) -> dict | None:
-        """Find a firmware record by file hash."""
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT * FROM firmware WHERE file_hash = ?", (file_hash,)
         ).fetchone()
         return dict(row) if row else None
 

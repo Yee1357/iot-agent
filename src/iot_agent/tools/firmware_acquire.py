@@ -1,7 +1,7 @@
 """Firmware acquisition, extraction, and normalization — all on VM.
 
-Supports:
-- Multi-source search (OpenWrt, TP-Link, GitHub)
+Firmware URLs are found by the agent itself (WebSearch / vendor support
+pages); this module only does the deterministic part:
 - Direct URL download (wget on VM)
 - Extract + normalize nested firmware to standardized rootfs/ layout
 - Local SQLite index for caching downloaded firmware metadata
@@ -13,32 +13,17 @@ Usage:
     async with VMRemoteExecutor() as vm:
         acquirer = FirmwareAcquirer(vm)
 
-        # Search for firmware across sources
-        results = await acquirer.search_sources("dlink", "dir-815")
-
-        # Search → download → extract in one step
-        rootfs = await acquirer.search_and_download("dlink", "dir-815")
-
         # Direct URL download + extract
         rootfs = await acquirer.extract(
             "https://download1.dlink.com/...",
             brand="dlink", model="dir-815", version="v1"
         )
-
-        # Check local cache
-        cached = acquirer.list_cached(vendor="dlink")
 """
 
 from __future__ import annotations
 
 import structlog
 from iot_agent.tools.firmware_index import FirmwareIndex
-from iot_agent.tools.firmware_sources import (
-    FirmwareResult,
-    FirmwareSource,
-    normalize_vendor,
-    search_all,
-)
 from iot_agent.tools.remote_vm import VMRemoteExecutor, RemoteResult
 
 logger = structlog.get_logger(__name__)
@@ -51,89 +36,16 @@ class FirmwareAcquirer:
     Supports:
     - Direct URL download (wget on VM)
     - Extract + normalize nested firmware to standardized rootfs/ layout
-    - Multi-source firmware search (OpenWrt, TP-Link, GitHub)
     - Local SQLite index for dedup and caching
     """
 
     def __init__(
         self,
         vm: VMRemoteExecutor,
-        db_path: str = "./data/firmware_index.db",
+        db_path: str = "",
     ) -> None:
         self.vm = vm
         self.index = FirmwareIndex(db_path)
-
-    # -----------------------------------------------------------------------
-    # Search
-    # -----------------------------------------------------------------------
-
-    async def search_sources(
-        self,
-        vendor: str,
-        model: str,
-        limit: int = 20,
-    ) -> list[FirmwareResult]:
-        """Search all firmware sources for matching vendor/model.
-
-        Returns a list of FirmwareResult from OpenWrt, TP-Link, GitHub.
-        Partial failures are logged and skipped.
-        """
-        results = await search_all(vendor, model, limit=limit)
-        logger.info("firmware search complete",
-                     vendor=vendor, model=model, found=len(results))
-        return results
-
-    async def search_and_download(
-        self,
-        vendor: str,
-        model: str,
-        version: str = "",
-        brand: str = "",
-    ) -> str | None:
-        """Search sources, pick best match, download, extract. Returns rootfs path.
-
-        Selection priority: version match > source priority (openwrt > tp-link > github) > file size.
-        """
-        results = await self.search_sources(vendor, model)
-        if not results:
-            logger.warning("no firmware found", vendor=vendor, model=model)
-            return None
-
-        # Filter by version if specified
-        if version:
-            versioned = [r for r in results if version.lower() in r.version.lower()]
-            if versioned:
-                results = versioned
-
-        # Sort: prefer openwrt (most reliable), then by having a version
-        source_priority = {"openwrt": 0, "tp-link": 1, "github": 2}
-        results.sort(key=lambda r: (source_priority.get(r.source, 9), not bool(r.version)))
-
-        best = results[0]
-        logger.info("selected firmware",
-                     vendor=best.vendor, model=best.model,
-                     version=best.version, source=best.source, url=best.url)
-
-        # Check local index first
-        cached = self.index.find_by_url(best.url)
-        if cached and cached.get("rootfs_path"):
-            logger.info("firmware already cached", rootfs=cached["rootfs_path"])
-            return cached["rootfs_path"]
-
-        # Download
-        fw_path = await self.from_url(best.url)
-        if not fw_path:
-            return None
-
-        # Extract
-        effective_brand = brand or best.vendor or vendor
-        rootfs = await self.extract(
-            fw_path,
-            brand=effective_brand,
-            model=best.model,
-            version=best.version or version,
-        )
-        return rootfs
 
     # -----------------------------------------------------------------------
     # Download
@@ -183,13 +95,18 @@ class FirmwareAcquirer:
         version: str = "unknown",
     ) -> str | None:
         """
-        Extract and normalize a firmware image to a standardized rootfs/.
+        Download (if URL) and extract a firmware image to a standardized rootfs/.
 
         Handles nested formats (zip→.web→.bin→squashfs→cpio...) automatically.
         Returns the path to the rootfs/ directory on VM, or None on failure.
         """
         if not self.vm.configured:
             return None
+
+        if firmware_path.startswith("http"):
+            firmware_path = await self.from_url(firmware_path)
+            if not firmware_path:
+                return None
 
         base = f"/data/extracted/{brand}/{model}_{version}"
         raw_dir = f"{base}/_raw"
@@ -264,33 +181,19 @@ class FirmwareAcquirer:
 
         logger.info("firmware extracted", rootfs=rootfs_dir, source=best)
 
-        # Update index
-        if firmware_path.startswith("http"):
-            self.index.mark_extracted(firmware_path, rootfs_dir)
-        else:
-            self.index.record(
-                vendor=brand, model=model, version=version,
-                url=firmware_path, rootfs_path=rootfs_dir,
-            )
+        # Update index (record = upsert by URL; covers both URL downloads
+        # recorded by from_url and direct local-path inputs)
+        self.index.record(
+            vendor=brand, model=model, version=version,
+            url=firmware_path, rootfs_path=rootfs_dir,
+        )
+        self.index.mark_extracted(firmware_path, rootfs_dir)
 
         return rootfs_dir
 
     # -----------------------------------------------------------------------
     # Cache / index
     # -----------------------------------------------------------------------
-
-    def list_cached(
-        self,
-        vendor: str = "",
-        model: str = "",
-        version: str = "",
-    ) -> list[dict]:
-        """Query local firmware index."""
-        return self.index.search(vendor=vendor, model=model, version=version)
-
-    def cache_stats(self) -> dict:
-        """Return cache statistics."""
-        return self.index.stats()
 
     async def cache_status(self) -> dict:
         """Return status of the local firmware cache on the VM."""

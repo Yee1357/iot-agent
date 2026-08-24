@@ -54,22 +54,36 @@ from iot_agent.tools.ida_mcp import VulnerabilityFinding
 
 logger = structlog.get_logger(__name__)
 
+#: canonical verdicts (always stored lowercase; input case is normalized)
+_VERDICTS = ("confirmed", "disproved", "weakened", "needs_dynamic", "pending")
+
+#: project root (``src/iot_agent/tools/...`` -> repo root) -- DB paths must
+#: not depend on the process CWD, the MCP server may start from anywhere.
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _norm_verdict(verdict: str) -> str:
+    return (verdict or "").strip().lower()
+
 
 class AnalysisStore:
     """SQLite-backed analysis task and finding storage."""
 
-    def __init__(self, db_path: str = "./data/analysis.db") -> None:
-        self._db_path = Path(db_path)
+    def __init__(self, db_path: str = "") -> None:
+        self._db_path = Path(db_path) if db_path else _PROJECT_ROOT / "data" / "analysis.db"
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: sqlite3.Connection | None = None
         self._init_db()
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
-            self._conn = sqlite3.connect(str(self._db_path))
+            self._conn = sqlite3.connect(
+                str(self._db_path), timeout=10, check_same_thread=False
+            )
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
+            self._conn.execute("PRAGMA busy_timeout=10000")
         return self._conn
 
     def _init_db(self) -> None:
@@ -141,6 +155,8 @@ class AnalysisStore:
             CREATE INDEX IF NOT EXISTS idx_exp_category
                 ON experiences(category);
         """)
+        # One-time normalization of pre-existing verdict values
+        conn.execute("UPDATE findings SET verdict = LOWER(verdict)")
         conn.commit()
 
     def close(self) -> None:
@@ -241,6 +257,7 @@ class AnalysisStore:
         """Record a VulnerabilityFinding. Returns finding id."""
         conn = self._get_conn()
         now = time.time()
+        verdict = _norm_verdict(verdict)
         cur = conn.execute("""
             INSERT INTO findings
                 (task_id, title, severity, cwe_id, cve_id,
@@ -282,6 +299,8 @@ class AnalysisStore:
         """Update arbitrary fields on a finding."""
         if not fields:
             return
+        if "verdict" in fields:
+            fields["verdict"] = _norm_verdict(str(fields["verdict"]))
         conn = self._get_conn()
         fields["updated_at"] = time.time()
         set_clause = ", ".join(f"{k} = ?" for k in fields)

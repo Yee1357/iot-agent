@@ -23,7 +23,7 @@ Level 4: 动态验证 → user-mode/chroot 跑起来确认可利用性
 
 **目标**：提取型号、版本信息，找出攻击面（CGI、HTTP 服务、网络守护进程）。
 
-1. 固件解包：`iot_firmware_search_and_download(vendor, model)` 或 `iot_firmware_extract(firmware_path, brand, model, version)` → 得到 rootfs 路径
+1. 固件解包：WebSearch/WebFetch 找官方固件直链 → `iot_firmware_extract(firmware_url_or_path, brand, model, version)` → 得到 rootfs 路径
 2. 提取型号/版本（VM）：
    ```
    iot_vm_execute("cat <rootfs>/etc/product.txt <rootfs>/etc/version 2>/dev/null")

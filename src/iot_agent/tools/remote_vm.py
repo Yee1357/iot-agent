@@ -17,6 +17,13 @@ logger = structlog.get_logger(__name__)
 
 @dataclass
 class RemoteResult:
+    """Result of a VM command.
+
+    ``success`` means the command *exited with code 0* (not merely "SSH
+    transport worked"). ``exit_code`` is always authoritative; on transport
+    failure ``success`` is False and ``exit_code`` is -1.
+    """
+
     stdout: str
     stderr: str
     exit_code: int
@@ -29,13 +36,9 @@ class RemoteResult:
 class VMRemoteExecutor:
     """Execute commands on the dedicated security VM via SSH (paramiko).
 
-    Supports connection reuse — use as a context manager for best performance::
-
-        async with VMRemoteExecutor() as vm:
-            await vm.execute("ls /")
-            await vm.execute("binwalk -Me firmware.bin")  # reuses the same connection
-
-    Without context manager, each operation opens and closes a new connection.
+    One persistent connection is reused across all operations (auto-reconnect
+    on drop); every public operation is serialized by an asyncio lock so
+    concurrent tool calls cannot interleave on the same paramiko client.
     """
 
     def __init__(self) -> None:
@@ -45,25 +48,32 @@ class VMRemoteExecutor:
         self._password = settings.vm_ssh_password
         self._key = settings.vm_ssh_key_path
         self._ssh: paramiko.SSHClient | None = None
+        #: serializes public operations; connect/close have their own lock so
+        #: first-connect races are safe without deadlocking (lock order:
+        #: ``_op_lock`` -> ``_conn_lock``, never the reverse).
+        self._op_lock = asyncio.Lock()
+        self._conn_lock = asyncio.Lock()
 
     # -- lifecycle -----------------------------------------------------------
 
     async def connect(self) -> None:
-        """Establish a persistent SSH connection."""
-        if self._ssh is not None:
-            return
-        self._ssh = await asyncio.to_thread(self._make_connection)
-        logger.info("SSH connected", host=self._host)
+        """Establish a persistent SSH connection (idempotent, race-safe)."""
+        async with self._conn_lock:
+            if self._ssh is not None:
+                return
+            self._ssh = await asyncio.to_thread(self._make_connection)
+            logger.info("SSH connected", host=self._host)
 
     async def close(self) -> None:
         """Close the persistent SSH connection."""
-        if self._ssh is not None:
-            try:
-                self._ssh.close()
-            except Exception:
-                pass
-            self._ssh = None
-            logger.debug("SSH disconnected")
+        async with self._conn_lock:
+            if self._ssh is not None:
+                try:
+                    self._ssh.close()
+                except Exception:
+                    pass
+                self._ssh = None
+                logger.debug("SSH disconnected")
 
     async def __aenter__(self) -> "VMRemoteExecutor":
         await self.connect()
@@ -130,10 +140,10 @@ class VMRemoteExecutor:
         return result.success and "ok" in result.stdout
 
     async def execute(self, cmd: str, timeout: int = 300) -> RemoteResult:
-        """Run a command on the VM.
+        """Run a command on the VM over the pooled connection.
 
-        If a persistent connection is open (context manager), reuses it.
-        Otherwise opens a one-off connection.
+        ``success`` is True only when the command exited 0; always check
+        ``exit_code`` for the authoritative status.
         """
         if not self.configured:
             return RemoteResult("", "VM not configured", -1, False)
@@ -141,27 +151,29 @@ class VMRemoteExecutor:
         def _run(ssh: paramiko.SSHClient) -> RemoteResult:
             try:
                 _in, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
+                exit_code = stdout.channel.recv_exit_status()
                 return RemoteResult(
                     stdout=stdout.read().decode(errors="replace"),
                     stderr=stderr.read().decode(errors="replace"),
-                    exit_code=stdout.channel.recv_exit_status(),
-                    success=True,
+                    exit_code=exit_code,
+                    success=exit_code == 0,
                 )
             except paramiko.SSHException:
                 raise  # let outer code handle retry
             except Exception as e:
                 return RemoteResult("", str(e), -1, False)
 
-        try:
-            ssh = await self._get_ssh()
-            return await asyncio.to_thread(_run, ssh)
-        except (paramiko.SSHException, VMConnectionError):
-            # Connection died — retry once with a fresh connection
-            logger.warning("SSH connection lost, reconnecting")
-            await self.close()
-            await self.connect()
-            ssh = await self._get_ssh()
-            return await asyncio.to_thread(_run, ssh)
+        async with self._op_lock:
+            try:
+                ssh = await self._get_ssh()
+                return await asyncio.to_thread(_run, ssh)
+            except (paramiko.SSHException, VMConnectionError):
+                # Connection died — retry once with a fresh connection
+                logger.warning("SSH connection lost, reconnecting")
+                await self.close()
+                await self.connect()
+                ssh = await self._get_ssh()
+                return await asyncio.to_thread(_run, ssh)
 
     async def upload(self, local_path: str, remote_path: str) -> bool:
         """SCP a file to VM."""
@@ -178,15 +190,16 @@ class VMRemoteExecutor:
                 logger.exception("scp upload failed")
                 return False
 
-        try:
-            ssh = await self._get_ssh()
-            return await asyncio.to_thread(_scp, ssh)
-        except (paramiko.SSHException, VMConnectionError):
-            logger.warning("SSH connection lost during upload, reconnecting")
-            await self.close()
-            await self.connect()
-            ssh = await self._get_ssh()
-            return await asyncio.to_thread(_scp, ssh)
+        async with self._op_lock:
+            try:
+                ssh = await self._get_ssh()
+                return await asyncio.to_thread(_scp, ssh)
+            except (paramiko.SSHException, VMConnectionError):
+                logger.warning("SSH connection lost during upload, reconnecting")
+                await self.close()
+                await self.connect()
+                ssh = await self._get_ssh()
+                return await asyncio.to_thread(_scp, ssh)
 
     async def download(self, remote_path: str, local_path: str) -> bool:
         """SCP a file from VM."""
@@ -205,15 +218,16 @@ class VMRemoteExecutor:
                 logger.exception("scp download failed")
                 return False
 
-        try:
-            ssh = await self._get_ssh()
-            return await asyncio.to_thread(_scp, ssh)
-        except (paramiko.SSHException, VMConnectionError):
-            logger.warning("SSH connection lost during download, reconnecting")
-            await self.close()
-            await self.connect()
-            ssh = await self._get_ssh()
-            return await asyncio.to_thread(_scp, ssh)
+        async with self._op_lock:
+            try:
+                ssh = await self._get_ssh()
+                return await asyncio.to_thread(_scp, ssh)
+            except (paramiko.SSHException, VMConnectionError):
+                logger.warning("SSH connection lost during download, reconnecting")
+                await self.close()
+                await self.connect()
+                ssh = await self._get_ssh()
+                return await asyncio.to_thread(_scp, ssh)
 
     # -- High-level wrappers ------------------------------------------------
 
@@ -233,16 +247,3 @@ class VMRemoteExecutor:
                 if name in statuses:
                     statuses[name] = status == "ok"
         return statuses
-
-    async def run_binwalk(self, firmware_path: str, output_dir: str) -> RemoteResult:
-        """Extract firmware with binwalk."""
-        cmd = f"mkdir -p {output_dir} && cd {output_dir} && binwalk -Me {firmware_path} 2>&1"
-        return await self.execute(cmd, timeout=600)
-
-    async def check_firmware_integrity(self, path: str, md5: str = "") -> bool:
-        """Verify firmware file exists (and optionally hash)."""
-        if md5:
-            r = await self.execute(f"md5sum {path}")
-            return md5 in r.stdout
-        r = await self.execute(f"test -f {path} && echo ok")
-        return r.success and "ok" in r.stdout

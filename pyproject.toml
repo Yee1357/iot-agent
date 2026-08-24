@@ -17,8 +17,6 @@ dependencies = [
     "pydantic>=2.13",
     "pydantic-settings>=2.14",
     "structlog>=26.0",
-    "beautifulsoup4>=4.12",
-    "lxml>=5.0",
 ]
 
 

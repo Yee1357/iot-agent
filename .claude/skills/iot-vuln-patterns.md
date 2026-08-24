@@ -47,7 +47,7 @@ HTTP GET/POST
 
 **路由器常见。** UPnP 服务处理 SOAP XML 请求，常在特权进程（root）中运行。
 
-### 兟型路径
+### 典型路径
 ```
 SSDP multicast / UPnP SOAP request
   → XML 解析（mini_xml / mxml）

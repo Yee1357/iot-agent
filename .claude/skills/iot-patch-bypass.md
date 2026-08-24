@@ -20,7 +20,7 @@ argument-hint: "[old_version] [new_version]"
 
 ### Step 2：获取新旧版本固件
 
-用 `iot_firmware_search_and_download(vendor, model, version=...)` 分别下载新旧版本，或：
+用 WebSearch/WebFetch 分别找新旧版本官方固件直链，`iot_firmware_extract(url, brand=..., model=..., version=...)` 下载解包，或：
 ```text
 iot_vm_execute("ls /data/firmware/<vendor>/")
 iot_firmware_extract("/data/firmware/<vendor>/<model>_<version>.bin", brand=..., model=..., version=...)

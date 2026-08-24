@@ -19,7 +19,6 @@ drop) instead of paying a handshake per call.
 
 from __future__ import annotations
 
-from dataclasses import asdict
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -28,7 +27,6 @@ from iot_agent.tools.analysis_store import AnalysisStore
 from iot_agent.tools.emulation_env import EmulationManager
 from iot_agent.tools.firmware_acquire import FirmwareAcquirer
 from iot_agent.tools.firmware_index import FirmwareIndex
-from iot_agent.tools.firmware_sources import search_all
 from iot_agent.tools.ida_mcp import VulnerabilityFinding, cleanup_ida_files
 from iot_agent.tools.remote_vm import VMRemoteExecutor
 
@@ -105,43 +103,21 @@ async def iot_vm_download(remote_path: str, local_path: str) -> bool:
 
 
 @app.tool()
-async def iot_firmware_search(
-    vendor: str,
-    model: str,
-    limit: int = 20,
-) -> list[dict[str, Any]]:
-    """Search OpenWrt / TP-Link / GitHub for firmware matching vendor+model."""
-    results = await search_all(vendor, model, limit=limit)
-    return [asdict(r) for r in results]
-
-
-@app.tool()
-async def iot_firmware_search_and_download(
-    vendor: str,
-    model: str,
-    version: str = "",
-    brand: str = "",
-) -> str | None:
-    """Search, download and extract the best matching firmware. Returns rootfs path."""
-    vm = await _vm_ready()
-    acquirer = FirmwareAcquirer(vm)
-    return await acquirer.search_and_download(
-        vendor, model, version=version, brand=brand
-    )
-
-
-@app.tool()
 async def iot_firmware_extract(
-    firmware_path: str,
+    firmware_url_or_path: str,
     brand: str = "unknown",
     model: str = "unknown",
     version: str = "unknown",
 ) -> str | None:
-    """Download/extract a firmware image on the VM. Returns rootfs path."""
+    """Download (if URL) and extract a firmware image on the VM. Returns rootfs path.
+
+    Find the firmware download URL yourself (WebSearch / vendor support pages,
+    prefer official vendor direct links) and pass it here.
+    """
     vm = await _vm_ready()
     acquirer = FirmwareAcquirer(vm)
     return await acquirer.extract(
-        firmware_path, brand=brand, model=model, version=version
+        firmware_url_or_path, brand=brand, model=model, version=version
     )
 
 

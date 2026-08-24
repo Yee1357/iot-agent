@@ -35,16 +35,6 @@ class VMConnectionError(IoTAgentError):
         super().__init__(f"VM connection failed ({host}): {reason}")
 
 
-class VMCommandError(IoTAgentError):
-    """VM command execution failed with non-zero exit code."""
-
-    def __init__(self, cmd: str, exit_code: int, stderr: str):
-        self.cmd = cmd
-        self.exit_code = exit_code
-        self.stderr = stderr
-        super().__init__(f"Command failed (exit {exit_code}): {stderr[:200]}")
-
-
 # ---------------------------------------------------------------------------
 # IDA errors
 # ---------------------------------------------------------------------------
@@ -52,34 +42,3 @@ class VMCommandError(IoTAgentError):
 
 class IDAError(IoTAgentError):
     """Base IDA analysis error."""
-
-
-class IDAConnectionError(IDAError):
-    """Cannot connect to IDA (MCP server down or headless init failed)."""
-
-    def __init__(self, detail: str):
-        self.detail = detail
-        super().__init__(f"IDA connection failed: {detail}")
-
-
-# ---------------------------------------------------------------------------
-# Firmware errors
-# ---------------------------------------------------------------------------
-
-
-class FirmwareError(IoTAgentError):
-    """Firmware extraction or processing error."""
-
-    def __init__(self, message: str, path: str = ""):
-        self.path = path
-        super().__init__(message)
-
-
-class FirmwareSourceError(FirmwareError):
-    """Firmware source search/download error."""
-
-    def __init__(self, message: str, source: str = ""):
-        self.source = source
-        super().__init__(message)
-
-

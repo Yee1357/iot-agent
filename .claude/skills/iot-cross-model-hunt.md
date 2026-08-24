@@ -20,13 +20,7 @@ argument-hint: "[known_model] [vuln_description]"
 
 ### Step 2：获取同品牌其他型号固件
 
-用 `iot_firmware_search_and_download(vendor, model)` 搜索下载，或 `iot_vm_execute("ls /data/firmware/")` 查看 VM 上已有固件。
-
-如需手动指定 URL：
-```text
-iot_vm_execute("wget -O /data/firmware/<vendor>/<model>_<version>.bin <url>", timeout=600)
-iot_firmware_extract("/data/firmware/<vendor>/<model>_<version>.bin", brand=..., model=..., version=...)
-```
+用 WebSearch/WebFetch 找该型号官方固件直链后 `iot_firmware_extract(url, brand=..., model=..., version=...)` 下载解包，或 `iot_vm_execute("ls /data/firmware/")` 查看 VM 上已有固件。
 
 ### Step 3：解包
 
