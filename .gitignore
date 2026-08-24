@@ -1,7 +1,10 @@
+# 本地运行数据与自产知识：经验库 / 索引 / 报告 / ELF / 厂商知识 json，均不入库
+# knowledge/ 保留说明文档（README.md）；具体厂商知识 <vendor>.json 仅本地维护
 .env
-elfs/
 data/
 reports/
+elfs/
+knowledge/*.json
 __pycache__/
 *.pyc
 *.egg-info/

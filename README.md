@@ -1,126 +1,73 @@
 # IoT 漏洞挖掘 Agent
 
-通过 Claude Code（Agent 主体）+ MCP 工具链（VM SSH + IDA Pro）进行 IoT 固件解包、二进制逆向、漏洞发现与验证。
+基于 **Claude Code + MCP 工具链**的 IoT 固件漏洞挖掘助手：自动完成固件下载解包、攻击面识别、危险函数初筛、IDA 反编译验证与动态验证，产出带完整证据链的漏洞报告。
 
-**设计原则**：
-- Claude Code 是 Agent 主体，不写自定义 agent loop / 记忆——会话续跑靠 Claude Code resume，任务续跑靠 SQLite（AnalysisStore），跨会话经验靠 ExperienceStore（自我迭代）
-- 所有工具通过 `iot-agent` MCP server（stdio）暴露，Claude Code 只调工具，不在对话里内嵌 Python
-- VM 上只做两级轻量动态验证（-L 快速试错 → chroot 包裹 qemu 的正式验证），系统态模拟（FirmAE / QEMU system）已移除
-- 动态验证按证据分级：A 级（单进程直达 sink）完整验证；B 级（需补运行时数据）/ C 级（需多进程/网络/内核）报告静态证据与建议、交用户决策，不硬补
+## 功能
 
-## 系统要求
+- **固件获取与解包**：agent 用 WebSearch 定位官方固件直链 → VM 下载 → binwalk 递归解包并自动定位 rootfs
+- **四级挖掘流水线**：
+  - **L1 攻击面识别**：型号 / 版本 / 架构 + CGI、httpd、网络守护进程清单
+  - **L2 危险 sink 初筛**：radare2 扫描 system / sprintf / strcpy 等危险函数调用者，产出按优先级排序的候选列表
+  - **L3 反编译验证**：IDA headless 扫描（自动排除硬编码参数、追踪参数来源、提取上下文），逐候选给出 verdict
+  - **L4 动态验证**：qemu user-mode 快速试错 → chroot 包裹 qemu 正式验证（无 binfmt 依赖、无系统态模拟）
+- **verdict 体系**：CONFIRMED / DISPROVED / WEAKENED / NEEDS_DYNAMIC，结论必须来自 source→sink 证据链
+- **断点续跑**：任务与发现实时落库，中断后按未决候选恢复
+- **经验记忆**：跨会话沉淀漏洞模式 / 误报规律 / 验证技巧，支持反馈迭代与历史报告批量消化
+- **厂商知识合并**：`knowledge/<vendor>.json`（本地维护）登记厂商特有 sink / taint source，扫描时自动并入
+- **自动止损**：循环检测与尝试硬上限，环境受阻按四级路径升级、必要时交用户决策
 
-| 组件 | 要求 |
-|------|------|
-| **Claude Code** | 已安装，配置 `.mcp.json` |
-| **Python** | 3.12+（conda 环境 `iot-agent`） |
-| **IDA Pro** | 9.x（headless idalib，可选） |
-| **Linux VM** | Ubuntu，SSH 可达，安装 binwalk / radare2 / qemu-user-static |
+## 架构
 
-## 快速安装
+| 层 | 组件 | 职责 |
+|----|------|------|
+| Agent 主体 | Claude Code | 决策、流程推进、verdict 判定（策略见 `CLAUDE.md` 与 `.claude/skills/`） |
+| 工具层 | iot-agent MCP server | 唯一工具入口，`iot_*` 工具经 stdio 暴露 |
+| 执行层 | Linux VM（SSH） | 解包、radare2 初筛、动态验证（user-mode / chroot） |
+| 反编译层 | Windows + IDA Pro | L3 反编译（headless / ida-pro-mcp，可选） |
+| 数据层 | SQLite | 任务 / 发现 / 经验持久化（本地，不入库） |
+
+**原则：除 IDA 反编译外，所有操作都在 VM 上完成。**
+
+## 快速开始
 
 ```bash
 conda create -n iot-agent python=3.12 -y
 conda activate iot-agent
 pip install -e .
-cp .env.example .env   # 编辑填入 VM 和 IDA 配置
+cp .env.example .env   # 填写 VM SSH 与 IDA 配置
 ```
 
-## MCP 配置（Claude Code 接线）
+- `.mcp.json` 已注册 `iot-agent` server：项目目录运行 `claude`，首次启动批准后工具自动可用（`python` 须指向 conda `iot-agent` 环境）
+- VM 安装：`sudo apt install binwalk radare2 squashfs-tools qemu-user-static`
+- IDA Pro 9.x 可选（headless idalib）
 
-`.mcp.json` 注册本项目工具链：
+## 使用
 
-```json
-{
-  "mcpServers": {
-    "iot-agent": {
-      "type": "stdio",
-      "command": "python",
-      "args": ["-m", "iot_agent.mcp_server"]
-    }
-  }
-}
-```
+在 Claude Code 中说「分析 <品牌型号> 固件」，自动触发 `iot-vuln-discovery` 工作流。工具族：
 
-- **首次使用**：在项目目录运行 `claude`，首次启动会提示批准 `iot-agent` server——批准后每次启动自动加载，工具自动暴露给 LLM（无需任何开关）
-- **`python` 必须是 conda `iot-agent` 环境的解释器**（否则缺 `mcp` 模块，server 静默失败、工具不出现）。若 `python` 不在 PATH，把 `command` 换成绝对路径（如 `D:\anaconda3\envs\iot-agent\python.exe`）
-- 工作目录默认是项目根（无需 `cwd` 字段；如需指定可自行添加）
-- **验证**：`claude mcp list` 应显示 `iot-agent: ✓ Connected`；若 ✘ 或 Pending，按上面排查
-- **IDA 反编译**：`ida-pro-mcp` 走用户级配置（`claude mcp add` 已注册的 stdio 版，IDA 自带 python 跑插件），不在项目 `.mcp.json` 里重复注册，避免 scope 冲突；无 GUI 时用 `iot_ida_headless_scan`
+| 工具族 | 用途 |
+|--------|------|
+| `iot_vm_*` | VM shell / 文件传输 |
+| `iot_firmware_*` | 固件下载解包 / 缓存查询 |
+| `iot_emulation_*` | 架构判定 / qemu 定位 / 两级动态验证 / 清理 |
+| `iot_analysis_*` | 任务与发现持久化 / 续跑 / 统计 |
+| `iot_experience_*` | 经验记录 / 加载 / 反馈 / 报告消化 |
+| `iot_ida_*` / `iot_knowledge_*` | headless 扫描 / 厂商知识 |
 
-## 配置
+## 数据与隐私
 
-通过 `.env` 文件配置（`IOT_AGENT_` 前缀）：
+- 任务、发现、经验存于本地 `data/analysis.db`；报告在 `reports/`；ELF 在 `elfs/`；厂商知识 json 在 `knowledge/` —— 以上均为本地数据，已被 `.gitignore` 排除，不会进入 Git 仓库
+- `knowledge/README.md` 仅保留说明文档，具体厂商知识 `<vendor>.json` 只存本地
+- 报告与经验禁止出现机器特定路径（约定路径与占位符），保证跨会话安全复用
+- 迁移机器时拷贝 `data/` 与 `knowledge/` 即可带走全部积累
 
-```bash
-# IDA Pro
-IOT_AGENT_IDA_INSTALL_DIR=D:/path/to/IDA
-
-# Linux VM
-IOT_AGENT_VM_SSH_HOST=your-vm-ip
-IOT_AGENT_VM_SSH_PORT=22
-IOT_AGENT_VM_SSH_USER=ubuntu
-IOT_AGENT_VM_SSH_PASSWORD=your-password
-```
-
-## 项目结构
+## 目录
 
 ```
-iot-agent/
-├── src/iot_agent/
-│   ├── config.py                 # 配置
-│   ├── mcp_server.py             # MCP server（工具唯一入口，SSH 连接池）
-│   └── tools/
-│       ├── remote_vm.py          # VM SSH 远程执行（连接复用）
-│       ├── firmware_acquire.py   # 固件下载（URL 由 agent WebSearch 找）+ extract() 标准化解包
-│       ├── firmware_index.py     # 固件本地 SQLite 索引缓存
-│       ├── ida_mcp.py            # VulnerabilityFinding + IDAHeadlessClient（headless idalib）
-│       ├── ida_scanner.py        # IDA headless 扫描器（两轮筛选）
-│       ├── emulation_env.py      # 动态验证（-L 试错 + chroot 包裹 qemu，无系统态）
-│       ├── runtime_assets.py     # chroot 运行时资产（libnvram）
-│       └── analysis_store.py     # 任务/发现/经验持久化（SQLite）
-├── .claude/
-│   └── skills/
-│       ├── iot-agent.md          # 入口：身份 + 路由 + 工具速查
-│       ├── iot-vuln-discovery.md # 主力：四级递进漏洞挖掘
-│       ├── iot-vuln-patterns.md  # IoT 漏洞模式参考库（含厂商特有模式）
-│       ├── iot-emulate-firmware.md # 试错 + chroot+qemu 动态验证
-│       ├── iot-cross-model-hunt.md
-│       └── iot-patch-bypass.md
-├── knowledge/                    # 厂商分析知识库（机器可读，扫描时合并）
-│   ├── README.md
-│   └── dlink.json
-├── .mcp.json
-├── .env.example
-├── CLAUDE.md                     # Agent 决策中枢（身份/流水线/止损/记忆）
-└── pyproject.toml
-```
-
-## 分析流程
-
-```
-┌── VM ──────────────────────────────────────────────┐
-│  Level 1: FirmwareAcquirer.extract() → rootfs/      │
-│  Level 2: radare2 初筛 → 候选列表                   │
-│  Level 4: -L 试错 → chroot+qemu 正式验证 → PoC 结果  │
-└────────────────────────────────────────────────────┘
-                       │
-                       ▼ (需要 IDA 时 iot_vm_download)
-┌── Windows ─────────────────────────────────────────┐
-│  Level 3: IDAHeadlessScanner / decompile → verdict  │
-│  仅做反编译，每个候选 CONFIRMED/DISPROVED/...        │
-└────────────────────────────────────────────────────┘
-```
-
-## 断点续跑 & 经验记忆
-
-- **候选级续跑**：任务中断后 `iot_analysis_resume_task(task_id)` 返回未判定候选，已判定 verdict 的自动跳过
-- **经验记忆**：`iot_experience_load(vendor, arch)` 开局加载经验摘要；`iot_experience_record(...)` 记录教训；`iot_experience_bump(...)` 迭代反馈
-- 数据存于 `data/analysis.db`（SQLite）
-
-## VM 环境安装
-
-```bash
-sudo apt install binwalk radare2 squashfs-tools
-sudo apt install qemu-user-static   # user-mode 动态验证
+src/iot_agent/        # MCP server 与工具实现
+.claude/skills/       # 工作流 skill（路由 / 挖掘 / 验证 / 模式库）
+knowledge/            # 厂商知识：README.md 入库，<vendor>.json 仅本地
+data/                 # 本地数据库（analysis.db 经验库、固件索引）
+reports/              # 分析报告（本地）
+CLAUDE.md             # Agent 决策中枢
 ```
