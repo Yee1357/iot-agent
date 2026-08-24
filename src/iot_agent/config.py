@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     vm_ssh_password: str = ""
     vm_ssh_key_path: str = ""
     vm_firmware_dir: str = "/data/firmware"
-    #: Chroot runtime assets (busybox / libnvram / console) for single-service
+    #: Chroot runtime assets (libnvram shim) for single-service
     #: dynamic verification. Full-system emulation assets were removed.
     vm_runtime_dir: str = "/data/runtime-assets"
     #: Optional GitHub download mirror (e.g. "https://ghproxy.net/") for

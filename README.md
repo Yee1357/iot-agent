@@ -74,10 +74,10 @@ iot-agent/
 │       ├── remote_vm.py          # VM SSH 远程执行（连接复用）
 │       ├── firmware_acquire.py   # 固件下载（URL 由 agent WebSearch 找）+ extract() 标准化解包
 │       ├── firmware_index.py     # 固件本地 SQLite 索引缓存
-│       ├── ida_mcp.py            # IDAHeadlessClient + MCP Client
+│       ├── ida_mcp.py            # VulnerabilityFinding + IDAHeadlessClient（headless idalib）
 │       ├── ida_scanner.py        # IDA headless 扫描器（两轮筛选）
 │       ├── emulation_env.py      # 动态验证（-L 试错 + chroot 包裹 qemu，无系统态）
-│       ├── runtime_assets.py     # chroot 运行时资产（libnvram/busybox）
+│       ├── runtime_assets.py     # chroot 运行时资产（libnvram）
 │       └── analysis_store.py     # 任务/发现/经验持久化（SQLite）
 ├── .claude/
 │   └── skills/
