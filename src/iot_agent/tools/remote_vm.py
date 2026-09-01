@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 from dataclasses import dataclass
 
@@ -31,6 +32,22 @@ class RemoteResult:
 
     def __bool__(self) -> bool:
         return self.success
+
+
+def _shell_safe(cmd: str) -> str:
+    """Ship cmd past the VM login shell via ``echo '<b64>' | base64 -d | bash -s``.
+
+    sshd hands the command string to the user's login shell (zsh on kali),
+    where quotes/``$``/globs in paths used to explode. base64 of UTF-8 is
+    quote-free ASCII that no shell parser can touch, and forcing bash pins
+    shell semantics. The decoded script IS ``bash -s``'s stdin, so inner
+    stdin readers see EOF once the script is consumed. Line endings are
+    normalized to LF first — host-side callers may leak CRLF, which bash
+    would otherwise reject as ``$'\\r': command not found``.
+    """
+    script = cmd.replace("\r\n", "\n").replace("\r", "\n")
+    encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    return f"echo '{encoded}' | base64 -d | bash -s"
 
 
 class VMRemoteExecutor:
@@ -105,6 +122,11 @@ class VMRemoteExecutor:
             ssh.connect(**kwargs)
         except (paramiko.SSHException, OSError) as e:
             raise VMConnectionError(self._host, str(e)) from e
+        # Keepalive keeps the flow warm and detects a silently dropped link
+        # (vmnet/NAT) before the next call has to find out via its read timeout.
+        transport = ssh.get_transport()
+        if transport is not None:
+            transport.set_keepalive(15)
         return ssh
 
     def _is_alive(self) -> bool:
@@ -142,19 +164,27 @@ class VMRemoteExecutor:
     async def execute(self, cmd: str, timeout: int = 300) -> RemoteResult:
         """Run a command on the VM over the pooled connection.
 
-        ``success`` is True only when the command exited 0; always check
-        ``exit_code`` for the authoritative status.
+        The command is transported shell-safe (see :func:`_shell_safe`) and
+        executed by ``bash -s`` on the VM. ``success`` is True only when the
+        command exited 0; always check ``exit_code`` for the authoritative
+        status.
         """
         if not self.configured:
             return RemoteResult("", "VM not configured", -1, False)
 
         def _run(ssh: paramiko.SSHClient) -> RemoteResult:
             try:
-                _in, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
+                _in, stdout, stderr = ssh.exec_command(_shell_safe(cmd), timeout=timeout)
+                # Drain both streams BEFORE waiting on the exit status:
+                # recv_exit_status() ignores the channel timeout entirely and,
+                # called with unread output beyond the transport window
+                # (2 MiB default), deadlocks forever while holding _op_lock.
+                out = stdout.read().decode(errors="replace")
+                err = stderr.read().decode(errors="replace")
                 exit_code = stdout.channel.recv_exit_status()
                 return RemoteResult(
-                    stdout=stdout.read().decode(errors="replace"),
-                    stderr=stderr.read().decode(errors="replace"),
+                    stdout=out,
+                    stderr=err,
                     exit_code=exit_code,
                     success=exit_code == 0,
                 )

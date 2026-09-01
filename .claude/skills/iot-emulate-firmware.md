@@ -101,7 +101,7 @@ iot_emulation_chroot_cleanup(workdir="<rootfs>.chroot-qemu", process_match="qemu
 - 工作副本很大 → 磁盘紧张时验证完立即 `remove_workdir=True` 清理
 - **`/tmp` 或 `/var/run` 写不进去（"can't create"）** → 固件 /tmp 通常是 symlink→/var/tmp 且 /var/run 不存在（设备上 /var 是 tmpfs），chroot 必须挂 tmpfs（工具已自动处理；手动排查时 `ls -ld <workdir>/var/tmp <workdir>/var/run` 确认）
 - **`-L` 模式跑 guest 程序报 "Invalid ELF image"** → `-L` 只重定向 guest 内部 open，**程序路径本身是 host 路径**，必须写完整 host 路径（`qemu-mipsel-static -L <rootfs> <rootfs>/bin/sh ...`）；chroot 模式无此问题
-- **VM 诊断命令静默失败** → VM 默认 shell 可能是 zsh：`echo ===XXX===` 触发 `=command` 展开报错、含单引号的命令嵌套 `bash -c '...'` 会截断。**VM 上跑多段命令统一用 base64 编码执行**（`echo <b64> | base64 -d | bash`），这是项目已验证的稳法
+- **VM 诊断命令静默失败** → VM 默认 shell 曾是 zsh（`echo ===XXX===` 触发 `=command` 展开报错、含单引号命令嵌套会被截断）。**现已由传输层根治**：`remote_vm.py` 的 `execute()` 自动把命令包成 `echo '<b64>' | base64 -d | bash -s` 执行，调用方直接传任意含引号/`$`/通配符的原始命令即可，无需自己再 base64 包装（重复包装无害但多余）
 - **固件 daemon 需要运行时数据**（xmldb/NVRAM）→ 属 B 级，按验证边界处理，不硬补
 
 ## 取舍原则
