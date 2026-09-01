@@ -10,3 +10,5 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .claude/settings.local.json
+# 调试经验文档仅本地维护（skills 目录里唯一不入库的例外）
+.claude/skills/iot-emulation-debug-experience.md
