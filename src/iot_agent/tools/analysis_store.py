@@ -683,7 +683,7 @@ class AnalysisStore:
         """Export top experiences as a markdown block for manual promotion.
 
         Used to solidify proven dynamic lessons (e.g. success_count >= 3)
-        back into the static knowledge docs (``iot-vuln-patterns``).
+        back into the static knowledge docs (``knowledge/vuln-patterns.md``).
         """
         rows = self.search_experiences(
             category=category, limit=limit, summary_only=False

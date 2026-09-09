@@ -1,10 +1,12 @@
-# 本地运行数据与自产知识：经验库 / 索引 / 报告 / ELF / 厂商知识 json，均不入库
-# knowledge/ 保留说明文档（README.md）；具体厂商知识 <vendor>.json 仅本地维护
+# 本地运行数据与自产知识：经验库 / 索引 / 报告 / ELF / 厂商知识 json / 模式与仿真长文，均不入库
+# knowledge/ 保留说明文档（README.md）；<vendor>.json 与 vuln-patterns/emulation-experiences 仅本地维护
 .env
 data/
 reports/
 elfs/
 knowledge/*.json
+knowledge/vuln-patterns.md
+knowledge/emulation-experiences.md
 __pycache__/
 *.pyc
 *.egg-info/
@@ -12,8 +14,6 @@ __pycache__/
 .claude/settings.local.json
 # 本机环境速查（CLAUDE.md @import），仅本地维护
 CLAUDE.local.md
-# 调试经验文档仅本地维护（skills 目录里唯一不入库的例外）
-.claude/skills/iot-emulation-debug-experience.md
 # 临时脚本不入库（一次性分析/探针/封装脚本）
 scripts/
 # 攻击面/back path 分析产物（本地）

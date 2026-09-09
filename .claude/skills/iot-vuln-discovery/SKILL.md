@@ -96,7 +96,7 @@ stripped ELF 无输出时，改用 `rabin2 -i` / `strings` 兜底。
 ```
 iot_ida_headless_scan("elfs/<binary>", vendor="<厂商>")
 # vendor 可选：合并 knowledge/<vendor>.json 的厂商特有 sink/taint source
-#   （如 D-Link 的 lxmldbc_system / sobj_get_string，见 iot-vuln-patterns 模式 9）
+#   （如 D-Link 的 lxmldbc_system / sobj_get_string，见 knowledge/vuln-patterns.md 厂商 wrapper）
 # 输出：VulnerabilityFinding 列表，每个 finding 只含 sink 附近 ±8 行上下文
 ```
 
@@ -183,91 +183,7 @@ iot_analysis_mark_level(task_id, 3)
 
 ---
 
-## 判定示例（真实案例，来自 DIR-815 cgibin 的实际 headless 扫描）
-
-以下示例演示**完整的 verdict 推演过程**——不是背规则，是走 5 问的思考方式。
-代码片段为真实反编译输出（±8 行上下文）。
-
-> **铁律：静态推演 ≠ verdict。** 示例中只有经过 L4 动态验证的结论才能标
-> CONFIRMED；未经验证的高危候选一律标 **NEEDS_DYNAMIC**（推演再漂亮也不算数）。
-> 当前以下示例均为**静态推演状态**，供学习推演方法；验证后应回填真实 verdict 并附 PoC。
-
-### 示例 1：SSDP 服务 → lxmldbc_system（B 级，动态验证未完成——如实标注）
-
-```
-15 |     env_2 = getenv("REMOTE_PORT");
-16 |     env_3 = getenv("SERVER_ID");
-17 |     if ( env && env_1 && env_2 && env_3 )
-18 |     {
-19 |       if ( !strncmp(env, "ssdp:all", 8u) )
-20 |       {
-21 |         %s_ssdpall_%s:%s_%s_& = "%s ssdpall %s:%s %s &";
-22 | LABEL_17:
-23 |         lxmldbc_system(%s_ssdpall_%s:%s_%s_&);  ← SINK
-24 |         return 0;
-```
-
-**5 问推演**：
-1. **source**：`getenv("HTTP_ST")`（SSDP ST 头，用户可控）等 4 个 CGI 环境变量
-2. **路径**：env → 拼接命令模板 → `lxmldbc_system`（**反编译铁证：其实现 = `vsnprintf` 后直接 `system()`**）
-3. **过滤**：无
-4. **可达性**：SSDP 无认证可达；实际执行链为 cgibin 生成 M-SEARCH 脚本 → `xmldbc -P M-SEARCH.php` → php 查 xmldb 接口数据
-5. **结论**：静态证据链强（A 级结构），但动态验证实测为 **B 级**——卡在 `INF_getcurripaddr` 需 xmldb `/runtime/inf` 节点数据。按规则**不硬补，保持 NEEDS_DYNAMIC**，notes 按模板填写：
-
-```
-验证级别：B
-静态证据链：HTTP_ST/SERVER_ID(env) → sprintf 模板 → lxmldbc_system(=system)
-模拟进度：env 全部生效，SSDP 分支命中，M-SEARCH 脚本生成被触发，
-          M-SEARCH.php 执行至 INF_getcurripaddr 失败
-缺失环境：xmldb /runtime/inf 接口节点未初始化（设备未开机）
-建议：真机复现，或系统态模拟初始化后验证
-```
-
-**要点**：`lxmldbc_system` 是 cgibin 内部实现的 `system()`——静态上这是 A 级形状的命令注入；但**动态验证暴露了 B 级事实**（执行链依赖运行时数据）。**分级以动态实测为准，B 级不硬补、如实上报**。
-
-### 示例 2：sobj_get_string → xmldbc_ephp_wb（静态推演：高危候选，待 L4 验证）
-
-```
-126 |           if ( !strcmp(s_2, "SETCFG") )
-127 |           {
-128 |             string = (const char *)sobj_get_string(ptr_1);
-129 |             sprintf(s, "%s\nACTION=SETCFG\nPREFIX=%s/%s", "/htdocs/webinc/wand.php", "/runtime/session", string);
-130 |             xmldbc_ephp_wb(0, 0, s, dest, 128);  ← SINK
-```
-
-**5 问推演**：
-1. **source**：`sobj_get_string(ptr_1)`——D-Link CGI 参数 getter，等价用户输入（厂商 taint source，来自 knowledge/dlink.json）
-2. **路径**：sobj_get_string → sprintf 拼进 PHP 脚本命令 → `xmldbc_ephp_wb`（PHP 代码注入）
-3. **过滤**：无
-4. **可达性**：`SETCFG` 分支是 CGI 请求处理路径（pigwidgeoncgi），**但"请求能否到达该分支"未验证**——这是本候选的关键缺口
-5. **结论**：静态可疑，**可达性未证实 → NEEDS_DYNAMIC**。正确动作：L4 里构造含 SETCFG 的请求验证分支可达性；验证前不得标 CONFIRMED
-
-**要点**：taint 追踪工具（`trace_arg_source`）已经识别出 `sobj_get_string` 来源——AI 的职责是确认**可达性**（这个分支怎么触达）和**过滤**（拼接前后有没有消毒），而不是重新发明 source 分析。**可达性未证实 = 不许 CONFIRMED**，这正是示例 1/2 与"硬编结论"的区别。
-
-### 示例 3：captchacgi_main → system（信息不足时的正确动作）
-
-```
-39 |   cgibin_parse_request(sub_408CC4_1, 0, n64);
-40 |   captcha = sess_generate_captcha(buf);
-41 |   captcha_1 = captcha;
-42 |   if ( captcha )
-43 |   {
-44 |     sprintf(s, "rndimage -f /htdocs/web/docs/captcha_%d.jpeg -p /usr/sbin/fonts -w 180 -t 40 %s", captcha, v10);
-45 |     v7 = 0;
-46 |     system(s);  ← SINK
-```
-
-**5 问推演**：
-1. **source**：`captcha` 来自 `sess_generate_captcha(buf)`（服务端生成？）；`v10` 来源**未知**（上下文外）
-2. **路径**：`captcha` 是 `%d`（数字格式化，即使可控也难注入）；真正可疑的是 `v10`（`%s`）
-3. **过滤**：`%d` 限制了 captcha；v10 未定
-4. **可达性**：captcha 接口可达，但 sink 参数的可控部分未定
-5. **结论**：**不能下结论**——正确动作是请求完整反编译，追踪 `v10` 和 `buf` 的来源；追踪后仍不明 → **NEEDS_DYNAMIC**
-
-**要点**：看到 `system()` 不意味着漏洞——这个示例演示"**证据不足时必须继续追或标 NEEDS_DYNAMIC，禁止凭 system() 直接 CONFIRMED**"。
-
-**验证方法**：本节示例为真实 headless 扫描输出（历史 hunt 留档）；**每个示例的最终 verdict 必须经 L4 动态验证后回填**，未验证的保持 NEEDS_DYNAMIC。
-
+verdict 判定推演示例见 `knowledge/vuln-patterns.md` §判定推演示例。
 ---
 
 ## Level 4：动态验证（两级：试错 → chroot+qemu 验证）
@@ -314,7 +230,7 @@ Level 2 的每个候选必须在 Level 3 给出结论，Level 3 CONFIRMED 的在
 - `execve()` 传入 `{"/bin/sh", "-c", hardcoded_string, NULL}`
 
 ### 参考资料
-- IoT 常见漏洞模式：`iot-vuln-patterns`（含厂商特有 wrapper 模式）
+- IoT 常见漏洞模式：`knowledge/vuln-patterns.md`（含厂商特有 wrapper 模式，本地知识库）
 - 厂商特有 sink/taint 机器清单：`knowledge/<vendor>.json`
 - 动态验证细节：`iot-emulate-firmware`
 - 发现的真实案例记录到 `AnalysisStore`；经验沉淀到 `iot_experience_record`；

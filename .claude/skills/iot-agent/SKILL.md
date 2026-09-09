@@ -16,8 +16,9 @@ argument-hint: "[firmware|binary|report]"
 | 动态验证（user-mode/chroot） | `iot-emulate-firmware` |
 | 已知漏洞的跨型号影响 | `iot-cross-model-hunt` |
 | 固件补丁绕过分析 | `iot-patch-bypass` |
-| 漏洞模式参考（source→sink 模板） | `iot-vuln-patterns` |
-| qemu/仿真环境坑与修法 | `iot-emulation-debug-experience` |
+
+> 知识参考：漏洞模式读 `knowledge/vuln-patterns.md`；qemu/仿真环境坑读
+> `knowledge/emulation-experiences.md`；紧凑经验用 `iot_experience_load()` 加载。
 
 ## 开局与收尾检查单
 
@@ -60,7 +61,7 @@ argument-hint: "[firmware|binary|report]"
 - `iot_experience_record(category, scenario, detail, vendor, arch)` — 记录经验（scenario+vendor+arch 唯一 upsert）
 - `iot_experience_bump(exp_id, success)` — 迭代反馈
 - `iot_experience_ingest_report(report_path, vendor, arch)` — 批量消化历史报告进经验库
-- `iot_experience_export_markdown(category, min_success)` — 导出成熟经验供固化回写（≥3 次成功的 pattern 固化到 `iot-vuln-patterns` 或 `knowledge/<vendor>.json`）
+- `iot_experience_export_markdown(category, min_success)` — 导出成熟经验供固化回写（≥3 次成功的 pattern 固化到 `knowledge/vuln-patterns.md` 或 `knowledge/<vendor>.json`）
 - `iot_analysis_insights(vendor)` — 历史 verdict 聚合（哪些 sink 误报率高）
 - `iot_experience_stats()` — 经验统计
 
@@ -78,10 +79,10 @@ argument-hint: "[firmware|binary|report]"
   - `pattern`：可复用漏洞模式（如"D-Link cgibin 的 sobj_get_string 是 taint source"）
   - `false_positive`：误报规律（如"system 参数经 xmldbc 白名单校验，不可控"）
   - `verification`：验证技巧（如"chroot+qemu 验证需要工作副本"）
-- **qemu/仿真调试经验回写（强制，每洞一次）**：候选动态复现成功或明确受阻后，**先**增量写入 `iot-emulation-debug-experience` skill（先 grep 查重，语义重叠合入或交叉引用），同步 `experiences` 表，**然后**才进下一个候选。原则：逐洞沉淀，不攒批。
+- **经验回写（强制，每洞一次）**：候选动态复现成功或明确受阻后，先 `iot_experience_record` 入库（先加载/查重，语义重叠 bump 原条目），环境坑长文增量更新 `knowledge/emulation-experiences.md`（查重纪律见该文档头部，语义重叠合入或交叉引用），**然后**才进下一个候选。原则：逐洞沉淀，不攒批。
 - **hunt 结束**：最重要的 1-3 条教训入库
 - **迭代反馈**：再次验证有效 → `iot_experience_bump(exp_id, success=True)`；证伪 → bump(False)
-- **固化回写**：pattern 类经验累计成功 ≥3 → `iot_experience_export_markdown(category="pattern", min_success=3)` 导出，人工固化到 `iot-vuln-patterns` 或 `knowledge/<vendor>.json`
+- **固化回写**：pattern 类经验累计成功 ≥3 → `iot_experience_export_markdown(category="pattern", min_success=3)` 导出，人工固化到 `knowledge/vuln-patterns.md` 或 `knowledge/<vendor>.json`
 
 ## L3 升级提问格式（触发条件见 CLAUDE.md 硬约束）
 

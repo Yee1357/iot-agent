@@ -33,7 +33,8 @@
 | 动态验证细节（两级验证 / A/B/C 分级边界） | `iot-emulate-firmware` |
 | 跨型号漏洞传播 | `iot-cross-model-hunt` |
 | 补丁绕过分析 | `iot-patch-bypass` |
-| 漏洞模式参考 | `iot-vuln-patterns` |
+
+> 知识参考：漏洞模式 / 仿真环境坑读本地 `knowledge/vuln-patterns.md`、`knowledge/emulation-experiences.md`；紧凑经验用 `iot_experience_load()` 加载。
 
 verdict 全程只有四种：CONFIRMED / DISPROVED / WEAKENED / NEEDS_DYNAMIC（判定细则在 `iot-vuln-discovery`）。
 
@@ -48,6 +49,6 @@ verdict 全程只有四种：CONFIRMED / DISPROVED / WEAKENED / NEEDS_DYNAMIC（
 1. **止损硬上限**：同一动态验证方案 2 次尝试；L3 单候选 1 次完整反编译 + 数据流追踪；环境修复 1 轮排查；单 hunt 默认 2 小时。到点即升级。
 2. **L3 必须问用户**（用 `ask_user` 工具，提问前先 `iot_analysis_mark_level` 落库）：环境修复失败、需要外部资源、范围/目标冲突、同一失败连续 ≥3 次、hunt 超时、高危确认后"继续挖 vs 出报告"的方向选择。
 3. **续跑点必须可恢复**：随时 `iot_analysis_mark_level(task_id, level)` 记录进度，中断前 findings 已落库。断点续跑：`iot_analysis_list_tasks(status="running")` → `iot_analysis_resume_task(task_id)`。
-4. **经验回写强制（每洞一次）**：候选动态复现成功或明确受阻后，先把 qemu/仿真环境坑增量写入 `iot-emulation-debug-experience` skill（先 grep 查重，语义重叠合入原条目），同步 `experiences` 表（scenario 唯一 upsert），然后才进下一个候选。
+4. **经验回写强制（每洞一次）**：候选动态复现成功或明确受阻后，先把教训 `iot_experience_record` 入库（先 grep/加载查重，语义重叠 bump 原条目、scenario 唯一 upsert），环境坑长文增量更新 `knowledge/emulation-experiences.md`（同上查重纪律），然后才进下一个候选。
 5. **分析结束清理**：ELF 分析完 `iot_ida_cleanup(<elf_dir>)`；chroot 验证完 `iot_emulation_chroot_cleanup(workdir, remove_workdir=True)`。
 6. **报告/经验质量**：只沉淀可复用知识，禁机器特定路径（rootfs 写 `/data/extracted/<brand>/<model>_<ver>/rootfs`，本地 ELF 写 `elfs/<binary>`，VM 日志写 `/tmp/xxx.log`）；一次性信息不入库。

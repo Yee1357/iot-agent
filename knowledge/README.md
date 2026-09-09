@@ -35,7 +35,7 @@
 
 1. 复制本目录任意 json 为 `<vendor>.json`，填写厂商特有函数
 2. 调用 `iot_ida_headless_scan(binary_path, vendor="<vendor>")` 时自动生效
-3. 同时在 `iot-vuln-patterns` skill 的"厂商特有模式"一节补充说明文字
+3. 同时在 `knowledge/vuln-patterns.md`（本地知识库）的"厂商特有 wrapper 模式"一节补充说明文字
    （代码只读 JSON；文档给 agent 读，二者职责不同）
 
 ## 现有文件
@@ -45,11 +45,13 @@
 | `dlink.json` | D-Link | 两类形态：路由器 xmldbc wrapper 命令注入 + **DNS 系列 NAS（lighttpd+libcgic，cmd= 分发、wto 会话认证、system() 直拼）**；含认证模型与 wto 会话键 |
 | `dlink-deuteron.json` | D-Link (deuteron/anweb) | DIR-X1530 等 anweb(CivetWeb) + deuteron JRPC 体系：`action_work_handler` popen 注入、websocket/mg_get_var/CGI 参数 taint source、cpex 预认证入口 |
 | `tenda.json` | Tenda | libcommon.so 命令注入 wrapper（doSystemCmd：内部 vsnprintf→system）+ CGI 参数 getter（websGetVar，xref 极多） |
+| `vuln-patterns.md` | — | **漏洞模式长文**（9 类 source→sink 模板 + 厂商 wrapper + 判定推演示例） |
+| `emulation-experiences.md` | — | **qemu/仿真环境坑长文**（设备专项 DNS-320/DIR-X1530 + 2.x 环境坑 + 回写纪律），与 `experiences` 表双向同步 |
 
 ## 跨厂商共性观察（按厂商文件割裂的知识在这里补回横向规律）
 
 > 观察来自实战积累，新增厂商时顺手补充/修正。**这不是通用模式库**（通用模式在
-> `iot-vuln-patterns` skill），只记录"跨厂商反复出现的厂商侧特征"，用于快速对比。
+> `knowledge/vuln-patterns.md`），只记录"跨厂商反复出现的厂商侧特征"，用于快速对比。
 
 | 共性 | 说明 | 涉及厂商 |
 |------|------|---------|

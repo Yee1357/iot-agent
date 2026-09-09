@@ -463,7 +463,7 @@ def iot_experience_export_markdown(
     """Export proven experiences as a markdown block for manual promotion.
 
     Solidify dynamic lessons (success_count - fail_count >= min_success)
-    back into the static knowledge docs (iot-vuln-patterns).
+    back into the static knowledge docs (knowledge/vuln-patterns.md).
     """
     return AnalysisStore().export_experience_markdown(
         category=category, min_success=min_success, limit=limit
