@@ -30,9 +30,6 @@ class RemoteResult:
     exit_code: int
     success: bool
 
-    def __bool__(self) -> bool:
-        return self.success
-
 
 def _shell_safe(cmd: str) -> str:
     """Ship cmd past the VM login shell via ``echo '<b64>' | base64 -d | bash -s``.
@@ -154,12 +151,6 @@ class VMRemoteExecutor:
         return settings.vm_firmware_dir
 
     # -- command execution ---------------------------------------------------
-
-    async def is_available(self) -> bool:
-        if not self.configured:
-            return False
-        result = await self.execute("echo ok", timeout=5)
-        return result.success and "ok" in result.stdout
 
     async def execute(self, cmd: str, timeout: int = 300) -> RemoteResult:
         """Run a command on the VM over the pooled connection.

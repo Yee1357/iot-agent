@@ -460,49 +460,38 @@ class IDAHeadlessScanner:
         Uses IDAHeadlessClient.imports_query() + xrefs_to() for
         structured, batch-capable lookup.
         """
-        results: list[dict] = []
+        # Get functions matching dangerous sinks
+        imports = self.client.imports_query(self.sinks)
 
-        # Get imports matching dangerous sinks
-        import_data = self.client.imports_query(self.sinks)
-
-        # Collect unique import addresses
+        # Collect unique addresses (imports_query returns flat dicts)
         import_map: dict[str, dict] = {}
-        for entry in import_data:
-            if not isinstance(entry, dict):
-                continue
-            for imp in entry.get("data", []):
-                if isinstance(imp, dict) and imp.get("addr"):
-                    import_map[imp["addr"]] = imp
+        for imp in imports:
+            if isinstance(imp, dict) and imp.get("addr"):
+                import_map[imp["addr"]] = imp
 
         all_addrs = list(import_map.keys())
         if not all_addrs:
-            return results
+            return []
 
-        # Batch xrefs
-        try:
-            xrefs_data = self.client.xrefs_to(all_addrs)
-        except Exception:
-            logger.warning("xrefs query failed in headless scan", addr_count=len(all_addrs), exc_info=True)
-            return results
+        # Batch xrefs: [{"addr": import_hex, "xrefs": [{"addr", "fn"}]}]
+        xrefs_data = self.client.xrefs_to(all_addrs)
 
-        for entry in (xrefs_data if isinstance(xrefs_data, list) else []):
+        results: list[dict] = []
+        for entry in xrefs_data:
             if not isinstance(entry, dict):
                 continue
             imp_addr = entry.get("addr", "")
-            imp = import_map.get(imp_addr) or import_map.get(str(imp_addr))
+            imp = import_map.get(imp_addr)
             if not imp:
                 continue
             for xr in entry.get("xrefs", []):
                 if not isinstance(xr, dict):
                     continue
-                if xr.get("type") != "code":
-                    continue
-                fn = xr.get("fn") or {}
                 results.append({
-                    "dangerous_func": imp.get("imported_name", ""),
+                    "dangerous_func": imp["imported_name"],
                     "import_addr": imp_addr,
                     "caller_addr": xr.get("addr"),
-                    "caller_name": fn.get("name", "unknown"),
+                    "caller_name": xr.get("fn", "unknown"),
                 })
         return results
 

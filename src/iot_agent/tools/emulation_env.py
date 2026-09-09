@@ -46,7 +46,6 @@ _QEMU_USER = {
     "arm": "qemu-arm-static",
     "aarch64": "qemu-aarch64-static",
     "x86": "qemu-x86_64-static",
-    "i386": "qemu-i386-static",
 }
 
 

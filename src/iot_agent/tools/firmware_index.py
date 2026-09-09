@@ -11,7 +11,6 @@ Usage:
                url="http://...", local_path="/data/firmware/dir815.bin",
                file_hash="abc123")
     cached = idx.find_by_url("http://...")
-    all_fw = idx.list_all(vendor="dlink")
 """
 
 from __future__ import annotations
@@ -62,7 +61,6 @@ class FirmwareIndex:
                 source      TEXT NOT NULL DEFAULT '',
                 extracted   INTEGER DEFAULT 0,
                 rootfs_path TEXT NOT NULL DEFAULT '',
-                extra       TEXT NOT NULL DEFAULT '{}',
                 created_at  REAL NOT NULL,
                 updated_at  REAL NOT NULL
             );
@@ -92,11 +90,8 @@ class FirmwareIndex:
         file_size: int | None = None,
         source: str = "",
         rootfs_path: str = "",
-        extra: dict | None = None,
     ) -> int:
         """Insert or update a firmware record. Returns row id."""
-        import json
-
         conn = self._get_conn()
         now = time.time()
 
@@ -116,13 +111,11 @@ class FirmwareIndex:
                     file_size = COALESCE(?, file_size),
                     source = COALESCE(NULLIF(?, ''), source),
                     rootfs_path = COALESCE(NULLIF(?, ''), rootfs_path),
-                    extra = CASE WHEN ? = '{}' THEN extra ELSE ? END,
                     updated_at = ?
                 WHERE id = ?
             """, (
                 vendor, model, version, local_path, file_hash,
                 file_size, source, rootfs_path,
-                json.dumps(extra or {}), json.dumps(extra or {}),
                 now, existing["id"],
             ))
             conn.commit()
@@ -132,12 +125,11 @@ class FirmwareIndex:
         cur = conn.execute("""
             INSERT INTO firmware
                 (vendor, model, version, url, local_path, file_hash,
-                 file_size, source, rootfs_path, extra, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 file_size, source, rootfs_path, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             vendor, model, version, url, local_path, file_hash,
             file_size, source, rootfs_path,
-            json.dumps(extra or {}),
             now, now,
         ))
         conn.commit()
@@ -189,15 +181,6 @@ class FirmwareIndex:
         params.append(str(limit))
 
         rows = conn.execute(query, params).fetchall()
-        return [dict(r) for r in rows]
-
-    def list_all(self, limit: int = 100) -> list[dict]:
-        """List all cached firmware, newest first."""
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT * FROM firmware ORDER BY updated_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
         return [dict(r) for r in rows]
 
     def stats(self) -> dict:

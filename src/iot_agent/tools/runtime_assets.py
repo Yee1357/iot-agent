@@ -90,17 +90,12 @@ sha256sum {name} | awk '{{print $1}}'
 """.strip()
 
 
-async def provision_runtime_assets(
-    vm: VMRemoteExecutor, dry_run: bool = False
-) -> dict:
+async def provision_runtime_assets(vm: VMRemoteExecutor) -> dict:
     """Download runtime binaries into ``runtime_dir()`` (idempotent).
 
     Returns ``{"downloaded": [...], "skipped": [...], "failed": [...]}``.
     """
     summary: dict[str, list[str]] = {"downloaded": [], "skipped": [], "failed": []}
-    if dry_run:
-        summary["downloaded"] = list(RUNTIME_ASSETS)
-        return summary
 
     await vm.execute(f"mkdir -p {runtime_dir()}")
     manifest: dict = {}

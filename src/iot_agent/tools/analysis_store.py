@@ -35,14 +35,10 @@ Usage:
     # Experience memory
     store.record_experience(category="pattern", scenario="...", detail="...")
     store.search_experiences(vendor="dlink")
-
-    # Export
-    store.export_task_json(task_id, "./reports/dir-815.json")
 """
 
 from __future__ import annotations
 
-import json
 import re
 import sqlite3
 import time
@@ -155,8 +151,6 @@ class AnalysisStore:
             CREATE INDEX IF NOT EXISTS idx_exp_category
                 ON experiences(category);
         """)
-        # One-time normalization of pre-existing verdict values
-        conn.execute("UPDATE findings SET verdict = LOWER(verdict)")
         conn.commit()
 
     def close(self) -> None:
@@ -383,18 +377,6 @@ class AnalysisStore:
             },
         }
 
-    def export_task_json(self, task_id: int, path: str) -> None:
-        """Export task to a JSON file."""
-        data = self.export_task(task_id)
-        if not data:
-            logger.warning("no task found for export", task_id=task_id)
-            return
-
-        out = Path(path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-        logger.info("task exported", task_id=task_id, path=str(out))
-
     # -------------------------------------------------------------------
     # Statistics
     # -------------------------------------------------------------------
@@ -594,8 +576,6 @@ class AnalysisStore:
         scenario=heading, detail=body (trimmed, max 1200 chars).
         Returns the list of experience ids (0 recorded when nothing parseable).
         """
-        from pathlib import Path
-
         p = Path(report_path)
         if not p.is_file():
             logger.warning("report not found", path=report_path)

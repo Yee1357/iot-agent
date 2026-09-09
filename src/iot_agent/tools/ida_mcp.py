@@ -34,7 +34,6 @@ class VulnerabilityFinding:
     decompiled_code: str = ""
     exploit_vector: str = ""
     confidence: float = 0.0
-    is_known: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -98,10 +97,9 @@ class IDAHeadlessClient:
         return str(cfunc) if cfunc else None
 
     def imports_query(self, filters: list[str]) -> list[dict]:
-        """Query imports by name filters. Headless implementation using IDAPython.
+        """Query functions by name filters. Headless implementation using IDAPython.
 
-        Returns format compatible with MCP version:
-        [{"data": [{"addr": ..., "imported_name": ...}]}]
+        Returns: [{"addr": hex, "imported_name": name}]
         """
         import idautils, ida_funcs
 
@@ -114,18 +112,15 @@ class IDAHeadlessClient:
             name_lower = name.lower().lstrip("_")
             if any(fltr.lower() in name_lower for fltr in filters):
                 results.append({
-                    "data": [{
-                        "addr": hex(f),
-                        "imported_name": name,
-                    }]
+                    "addr": hex(f),
+                    "imported_name": name,
                 })
         return results
 
     def xrefs_to(self, addrs: str | list[str]) -> list[dict]:
-        """Get cross-references to given addresses. Headless implementation.
+        """Get code cross-references to given addresses. Headless implementation.
 
-        Returns format compatible with MCP version:
-        [{"addr": ..., "xrefs": [{"addr": ..., "type": "code", "fn": {"name": ...}}]}]
+        Returns: [{"addr": hex_of_import, "xrefs": [{"addr": caller_hex, "fn": name}]}]
         """
         import idautils, ida_funcs
 
@@ -145,8 +140,7 @@ class IDAHeadlessClient:
                     caller_name = ida_funcs.get_func_name(xref.frm) or "unknown"
                     xrefs.append({
                         "addr": hex(xref.frm),
-                        "type": "code",
-                        "fn": {"name": caller_name},
+                        "fn": caller_name,
                     })
 
             results.append({

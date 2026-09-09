@@ -39,10 +39,6 @@ class Settings(BaseSettings):
     # --- Logging ---
     log_level: str = "INFO"
 
-    @property
-    def vm_configured(self) -> bool:
-        return bool(self.vm_ssh_host and self.vm_ssh_user)
-
 
 # Global singleton
 settings = Settings()
