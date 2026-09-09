@@ -463,7 +463,7 @@ def iot_experience_export_markdown(
     """Export proven experiences as a markdown block for manual promotion.
 
     Solidify dynamic lessons (success_count - fail_count >= min_success)
-    back into the static knowledge docs (iot-vuln-patterns.md).
+    back into the static knowledge docs (iot-vuln-patterns).
     """
     return AnalysisStore().export_experience_markdown(
         category=category, min_success=min_success, limit=limit
@@ -525,8 +525,20 @@ def iot_ida_cleanup(elf_directory: str) -> int:
 
 
 def main() -> None:
-    """Run the MCP server over stdio for Claude Code."""
-    app.run(transport="stdio")
+    """Run the MCP server.
+
+    Default transport is stdio (for Claude Code). Pass ``--transport sse``
+    (or ``streamable-http``) to serve over HTTP; bind host/port via the
+    FASTMCP_HOST / FASTMCP_PORT environment variables.
+    """
+    import sys
+
+    transport = "stdio"
+    if "--transport" in sys.argv:
+        i = sys.argv.index("--transport")
+        if i + 1 < len(sys.argv):
+            transport = sys.argv[i + 1]
+    app.run(transport=transport)
 
 
 if __name__ == "__main__":

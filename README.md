@@ -37,7 +37,7 @@ pip install -e .
 cp .env.example .env   # 填写 VM SSH 与 IDA 配置
 ```
 
-- `.mcp.json` 已注册 `iot-agent` server：项目目录运行 `claude`，首次启动批准后工具自动可用（`python` 须指向 conda `iot-agent` 环境）
+- `.mcp.json` 已注册 `iot-agent` server 并指向 conda 环境的 Python 绝对路径，`.claude/settings.json` 已预授权：项目目录运行 `claude` 后 `iot_*` 工具自动可用，无需手动批准
 - VM 安装：`sudo apt install binwalk radare2 squashfs-tools qemu-user-static`
 - IDA Pro 9.x 可选（headless idalib）
 
@@ -56,7 +56,7 @@ cp .env.example .env   # 填写 VM SSH 与 IDA 配置
 
 ## 数据与隐私
 
-- 任务、发现、经验存于本地 `data/analysis.db`；报告在 `reports/`；ELF 在 `elfs/`；厂商知识 json 在 `knowledge/` —— 以上均为本地数据，已被 `.gitignore` 排除，不会进入 Git 仓库
+- 任务、发现、经验存于本地 `data/analysis.db`；固件缓存与索引在 `data/firmwares/`、`data/firmware_index.db`；历史报告消化源在 `data/my_vuln_reports/`；报告在 `reports/`；ELF 在 `elfs/`；厂商知识 json 在 `knowledge/` —— 以上均为本地数据，已被 `.gitignore` 排除，不会进入 Git 仓库
 - `knowledge/README.md` 仅保留说明文档，具体厂商知识 `<vendor>.json` 只存本地
 - 报告与经验禁止出现机器特定路径（约定路径与占位符），保证跨会话安全复用
 - 迁移机器时拷贝 `data/` 与 `knowledge/` 即可带走全部积累
@@ -67,7 +67,8 @@ cp .env.example .env   # 填写 VM SSH 与 IDA 配置
 src/iot_agent/        # MCP server 与工具实现
 .claude/skills/       # 工作流 skill（路由 / 挖掘 / 验证 / 模式库）
 knowledge/            # 厂商知识：README.md 入库，<vendor>.json 仅本地
-data/                 # 本地数据库（analysis.db 经验库、固件索引）
+data/                 # 本地数据库（analysis.db 经验库、固件缓存与索引、历史报告消化源）
 reports/              # 分析报告（本地）
+back_paths/           # 本地攻击面/路径分析产物（不入库）
 CLAUDE.md             # Agent 决策中枢
 ```

@@ -2,8 +2,8 @@
   "mcpServers": {
     "iot-agent": {
       "type": "stdio",
-      "command": "python",
-      "args": ["-m", "iot_agent.mcp_server"],
+      "command": "conda",
+      "args": ["run", "-n", "iot-agent", "--no-capture-output", "python", "-m", "iot_agent.mcp_server"],
       "env": {
         "PYTHONIOENCODING": "utf-8"
       }

@@ -1,6 +1,6 @@
 """Dynamic verification on the VM -- two tiers: quick probe + chroot-wrapped qemu-user.
 
-Design rules (also enforced in .claude/skills/iot-emulate-firmware.md):
+Design rules (also enforced in .claude/skills/iot-emulate-firmware/SKILL.md):
 
 1. Full-system emulation (FirmAE, manual QEMU system mode) is REMOVED --
    in practice it was the least reliable part of agent-driven analysis.

@@ -266,7 +266,7 @@ iot_analysis_mark_level(task_id, 3)
 
 **要点**：看到 `system()` 不意味着漏洞——这个示例演示"**证据不足时必须继续追或标 NEEDS_DYNAMIC，禁止凭 system() 直接 CONFIRMED**"。
 
-**示例获取与验证方法**：`scripts/gen_scan_examples.py` 在真实 IDA 环境重跑可重新生成全部真实 findings（输出到 `data/scan_findings.json`）；**每个示例的最终 verdict 必须经 L4 动态验证后回填**，未验证的保持 NEEDS_DYNAMIC。
+**验证方法**：本节示例为真实 headless 扫描输出（历史 hunt 留档）；**每个示例的最终 verdict 必须经 L4 动态验证后回填**，未验证的保持 NEEDS_DYNAMIC。
 
 ---
 
