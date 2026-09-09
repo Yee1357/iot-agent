@@ -66,7 +66,3 @@ Claude 按描述自动调起对应 skill；也可直接 `/iot-vuln-discovery`、
 | `iot_analysis_*` | 任务与发现落库 / 续跑 / 统计 |
 | `iot_experience_*` | 经验记忆：记录、加载、反馈迭代 |
 | `iot_ida_*` / `iot_knowledge_*` | IDA headless 扫描 / 厂商 sink 知识合并 |
-
-## License
-
-MIT
