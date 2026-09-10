@@ -7,8 +7,8 @@ Usage:
     from iot_agent.tools.firmware_index import FirmwareIndex
 
     idx = FirmwareIndex()
-    idx.record(vendor="dlink", model="dir-815", version="v1",
-               url="http://...", local_path="/data/firmware/dir815.bin",
+    idx.record(vendor="acme", model="router-x", version="v1",
+               url="http://...", local_path="/data/firmware/router-x.bin",
                file_hash="abc123")
     cached = idx.find_by_url("http://...")
 """

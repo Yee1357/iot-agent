@@ -235,7 +235,7 @@ class EmulationManager:
         # NB: firmware rootfs /var is usually a tmpfs at runtime -- /tmp is a
         # symlink to /var/tmp and /var/run does not exist in the image.
         # Without them the guest cannot write /tmp or /var/run at all
-        # ("can't create"), which breaks daemons and lxmldbc scripts.
+        # ("can't create"), which breaks daemons and their init scripts.
         mounts = await self.vm.execute(
             f"{sudo(f'mkdir -p {workdir}/var/tmp {workdir}/var/run')}; "
             f"mountpoint -q {workdir}/dev || {sudo(f'mount --bind /dev {workdir}/dev')}; "

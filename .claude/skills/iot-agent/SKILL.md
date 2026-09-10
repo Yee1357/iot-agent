@@ -76,8 +76,8 @@ argument-hint: "[firmware|binary|report]"
 - **历史报告消化**：`iot_experience_ingest_report("reports/<xxx>.md", vendor=..., arch=...)`（开局或收尾做一次）
 - **关键节点记录**（立即 `iot_experience_record`）：
   - `env`：环境坑及解法（如"某厂商固件需先挂载 jffs2"）
-  - `pattern`：可复用漏洞模式（如"D-Link cgibin 的 sobj_get_string 是 taint source"）
-  - `false_positive`：误报规律（如"system 参数经 xmldbc 白名单校验，不可控"）
+  - `pattern`：可复用漏洞模式（如"某厂商 CGI 参数 getter 是 taint source"）
+  - `false_positive`：误报规律（如"system 参数经厂商白名单校验，不可控"）
   - `verification`：验证技巧（如"chroot+qemu 验证需要工作副本"）
 - **经验回写（强制，每洞一次）**：候选动态复现成功或明确受阻后，先 `iot_experience_record` 入库（先加载/查重，语义重叠 bump 原条目），环境坑长文增量更新 `knowledge/emulation-experiences.md`（查重纪律见该文档头部，语义重叠合入或交叉引用），**然后**才进下一个候选。原则：逐洞沉淀，不攒批。
 - **hunt 结束**：最重要的 1-3 条教训入库

@@ -32,7 +32,7 @@ argument-hint: "[known_model] [vuln_description]"
 
 | 特征类型 | 示例 |
 |---------|------|
-| 函数名 | `hedwigcgi_main`、`hnap_main` |
+| 函数名 | 漏洞函数的符号名 |
 | 字符串常量 | 错误消息、日志格式串 |
 | 调用模式 | `getenv("HTTP_SOAPACTION")` → `system()` |
 | 二进制哈希 | 疑似同源 .so 的符号相似度 |
@@ -40,7 +40,7 @@ argument-hint: "[known_model] [vuln_description]"
 ### Step 5：跨型号比对
 
 对每个型号：
-1. 搜索同名 binary（如 `cgibin`、`httpd`）
+1. 搜索同名 binary（同厂商各型号常共用同一个主 CGI / httpd）
 2. 搜索同名函数（`list_funcs` → `decompile`）
 3. 对比伪代码差异：
    - 完全相同 → **大概率受影响**
@@ -58,9 +58,9 @@ argument-hint: "[known_model] [vuln_description]"
 ```
 | 型号 | 是否存在漏洞函数 | 差异描述 | 验证状态 |
 |------|-----------------|---------|---------|
-| DIR-645 | 存在，代码一致 | 无差异 | 待 L4 验证 |
-| DIR-815 | 存在，代码一致 | 无差异 | 待 L4 验证 |
-| DIR-860L | 存在，有差异 | system() 调用前增加了白名单检查 | 疑似 DISPROVED（静态判定） |
+| <model-a> | 存在，代码一致 | 无差异 | 待 L4 验证 |
+| <model-b> | 存在，代码一致 | 无差异 | 待 L4 验证 |
+| <model-c> | 存在，有差异 | system() 调用前增加了白名单检查 | 疑似 DISPROVED（静态判定） |
 ```
 
 > **铁律：静态比对 ≠ verdict**。代码一致只说明"疑似受影响"——CONFIRMED 必须经
@@ -75,4 +75,4 @@ argument-hint: "[known_model] [vuln_description]"
 
 - 不要仅凭函数名相同就下结论，必须对比伪代码
 - 关注编译优化导致的差异（同一源码不同编译选项可能生成不同的反编译结果）
-- 部分厂商在不同型号中改名但逻辑相同（如 `do_hnap` → `hnap_handler`）
+- 部分厂商在不同型号中改名但逻辑相同（如函数改名、wrapper 重命名）

@@ -19,13 +19,13 @@ argument-hint: "[firmware_model]"
 ## 验证边界（铁律：只完整验证 A 级，B/C 级交用户）
 
 **用户态模拟（chroot+qemu）只启动了一个进程视图——没有设备开机流程**：
-xmldb/NVRAM 运行时数据是空的、httpd/upnpd 等 daemon 不在、/proc 厂商文件缺失、
+厂商状态库/NVRAM 运行时数据是空的、httpd/upnpd 等 daemon 不在、/proc 厂商文件缺失、
 网络事件不会进来。所以漏洞必须分级，**只对 A 级做完整验证**：
 
 | 级别 | 定义 | 例子 | 处理 |
 |------|------|------|------|
 | **A 级** | 单进程内、输入→sink 直接可达，不依赖运行时数据/多进程/网络 | 命令注入直接 `system()`、栈溢出、文件操作、格式串 | **完整验证**（user-mode 或 chroot+qemu）→ 可 CONFIRMED |
-| **B 级** | 需补少量运行时数据（xmldb/NVRAM 节点）才能走完 | 如 SSDP 案例（`INF_getcurripaddr` 需接口数据）、经 NVRAM 的间接注入 | **不硬补**：静态证据 + 模拟走到哪一步，报告交用户决策 |
+| **B 级** | 需补少量运行时数据（厂商状态库 / NVRAM 节点）才能走完 | 如需接口数据才能拼出的命令（如 SSDP 类）、经 NVRAM 的间接注入 | **不硬补**：静态证据 + 模拟走到哪一步，报告交用户决策 |
 | **C 级** | 依赖多进程协同/网络会话/内核接口 | 认证绕过链路、需要真实 HTTP 会话的 handler、ioctl 设备 | **不验证**：报告静态分析结论 + 建议（真机/系统态），交用户 |
 
 **B/C 级处理流程**（禁止无限尝试）：
@@ -102,7 +102,7 @@ iot_emulation_chroot_cleanup(workdir="<rootfs>.chroot-qemu", process_match="qemu
 - **`/tmp` 或 `/var/run` 写不进去（"can't create"）** → 固件 /tmp 通常是 symlink→/var/tmp 且 /var/run 不存在（设备上 /var 是 tmpfs），chroot 必须挂 tmpfs（工具已自动处理；手动排查时 `ls -ld <workdir>/var/tmp <workdir>/var/run` 确认）
 - **`-L` 模式跑 guest 程序报 "Invalid ELF image"** → `-L` 只重定向 guest 内部 open，**程序路径本身是 host 路径**，必须写完整 host 路径（`qemu-mipsel-static -L <rootfs> <rootfs>/bin/sh ...`）；chroot 模式无此问题
 - **VM 诊断命令静默失败** → VM 默认 shell 曾是 zsh（`echo ===XXX===` 触发 `=command` 展开报错、含单引号命令嵌套会被截断）。**现已由传输层根治**：`remote_vm.py` 的 `execute()` 自动把命令包成 `echo '<b64>' | base64 -d | bash -s` 执行，调用方直接传任意含引号/`$`/通配符的原始命令即可，无需自己再 base64 包装（重复包装无害但多余）
-- **固件 daemon 需要运行时数据**（xmldb/NVRAM）→ 属 B 级，按验证边界处理，不硬补
+- **固件 daemon 需要运行时数据**（厂商状态库 / NVRAM）→ 属 B 级，按验证边界处理，不硬补
 
 ## 取舍原则
 

@@ -15,8 +15,8 @@ Usage:
 
         # Direct URL download + extract
         rootfs = await acquirer.extract(
-            "https://download1.dlink.com/...",
-            brand="dlink", model="dir-815", version="v1"
+            "https://download.example.com/fw.bin",
+            brand="acme", model="router-x", version="v1"
         )
 """
 
@@ -103,7 +103,8 @@ class FirmwareAcquirer:
         if not self.vm.configured:
             return None
 
-        if firmware_path.startswith("http"):
+        via_url = firmware_path.startswith("http")
+        if via_url:
             firmware_path = await self.from_url(firmware_path)
             if not firmware_path:
                 return None
@@ -121,48 +122,20 @@ class FirmwareAcquirer:
             timeout=600,
         )
 
-        # Step 2: find the actual root filesystem
-        find_rootfs = await self.vm.execute(
-            f"find {raw_dir} -type d "
-            f"\\( -name 'bin' -o -name 'sbin' -o -name 'etc' -o -name 'usr' \\) "
-            f"-print 2>/dev/null | sort | head -20"
+        # Step 2: find the actual root filesystem — one shell round-trip.
+        # A rootfs is the dir owning etc/passwd (or bin/sh / lib/libc.so, both
+        # often symlinks); each is a single file at the image's top level, so
+        # stripping its path suffix yields the root. Shallowest match wins
+        # (a nested usr/bin/sh must not strip to /usr). Replaces the old
+        # per-candidate × per-marker loop (up to ~50 SSH round-trips).
+        result = await self.vm.execute(
+            f"for m in etc/passwd bin/sh lib/libc.so; do "
+            f"f=$(find {raw_dir} \\( -type f -o -type l \\) -path \"*/$m\" 2>/dev/null "
+            f"| awk '{{print length, $0}}' | sort -n | head -1 | cut -d' ' -f2-); "
+            f"[ -n \"$f\" ] && {{ echo \"${{f%/$m}}\"; break; }}; "
+            f"done"
         )
-
-        # Heuristic: look for directories that look like a Linux rootfs
-        markers = ["bin/sh", "etc/passwd", "etc/init.d", "usr/sbin", "lib/libc.so"]
-        root_candidates = []
-        for line in find_rootfs.stdout.splitlines():
-            line = line.strip()
-            if not line or line.endswith("/bin") or line.endswith("/sbin"):
-                parent = line.rstrip("bin").rstrip("sbin").rstrip("/")
-                root_candidates.append(parent)
-            elif line.endswith("/etc"):
-                parent = line.rstrip("etc").rstrip("/")
-                root_candidates.append(parent)
-            elif line.endswith("/usr"):
-                parent = line.rstrip("usr").rstrip("/")
-                root_candidates.append(parent)
-
-        # Dedup and pick the best candidate
-        from collections import Counter
-        best = None
-        for path, _ in Counter(root_candidates).most_common(10):
-            for marker in markers:
-                r = await self.vm.execute(f"test -f {path}/{marker} && echo found")
-                if "found" in r.stdout:
-                    best = path
-                    break
-            if best:
-                break
-
-        if not best:
-            # Fallback: pick the deepest directory with /etc
-            result = await self.vm.execute(
-                f"find {raw_dir} -type f -name 'passwd' -path '*/etc/passwd' 2>/dev/null | "
-                f"head -1 | sed 's|/etc/passwd||'"
-            )
-            if result.success and result.stdout.strip():
-                best = result.stdout.strip()
+        best = result.stdout.strip().splitlines()[0] if result.stdout.strip() else None
 
         if not best:
             logger.error("could not locate rootfs in extracted firmware", raw_dir=raw_dir)
@@ -171,7 +144,7 @@ class FirmwareAcquirer:
         # Step 3: copy to standardized rootfs/
         await self.vm.execute(f"rm -rf {rootfs_dir}")
         result = await self.vm.execute(
-            f"cp -a {best}/. {rootfs_dir}/ 2>&1",
+            f"mkdir -p {rootfs_dir} && cp -a {best}/. {rootfs_dir}/ 2>&1",
             timeout=120,
         )
 
@@ -188,6 +161,21 @@ class FirmwareAcquirer:
             url=firmware_path, rootfs_path=rootfs_dir,
         )
         self.index.mark_extracted(firmware_path, rootfs_dir)
+
+        # Convenience: for a locally-supplied firmware, drop a `rootfs`
+        # symlink next to the .bin so the extracted tree is browsable in
+        # place. Best-effort (a read-only dir just skips it). URL downloads
+        # are skipped -- they land in the tool cache (/data/firmware), where a
+        # fixed link name would collide across firmwares. Authoritative copy
+        # stays under /data/extracted (see CLAUDE.md report-path convention).
+        if not via_url:
+            host_dir = firmware_path.rsplit("/", 1)[0] if "/" in firmware_path else "."
+            link = f"{host_dir}/rootfs"
+            r = await self.vm.execute(f"ln -sfn '{rootfs_dir}' '{link}'")
+            if r.success:
+                logger.info("rootfs symlink created", link=link, target=rootfs_dir)
+            else:
+                logger.warning("rootfs symlink failed", link=link, stderr=r.stderr[:200])
 
         return rootfs_dir
 

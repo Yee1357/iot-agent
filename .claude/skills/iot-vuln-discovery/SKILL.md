@@ -28,7 +28,7 @@ Level 4: 动态验证 → user-mode/chroot 跑起来确认可利用性
    ```
    iot_vm_execute("cat <rootfs>/etc/product.txt <rootfs>/etc/version 2>/dev/null")
    iot_vm_execute("grep -r 'model\\|version\\|firmware' <rootfs>/etc/ --include='*.conf' --include='*.xml' 2>/dev/null | head -20")
-   iot_vm_execute("strings <rootfs>/bin/busybox | grep -i 'dlink\\|cisco\\|tplink\\|netgear\\|tenda\\|totolink' | head -5")
+   iot_vm_execute("strings <rootfs>/bin/busybox | grep -i '<厂商品牌关键字>' | head -5")
    ```
 3. 识别攻击面（VM）：
    ```
@@ -96,7 +96,7 @@ stripped ELF 无输出时，改用 `rabin2 -i` / `strings` 兜底。
 ```
 iot_ida_headless_scan("elfs/<binary>", vendor="<厂商>")
 # vendor 可选：合并 knowledge/<vendor>.json 的厂商特有 sink/taint source
-#   （如 D-Link 的 lxmldbc_system / sobj_get_string，见 knowledge/vuln-patterns.md 厂商 wrapper）
+#   （厂商特有 wrapper sink / taint source，见 knowledge/<vendor>.json；具体厂商示例在 knowledge/vuln-patterns.md）
 # 输出：VulnerabilityFinding 列表，每个 finding 只含 sink 附近 ±8 行上下文
 ```
 
@@ -159,16 +159,16 @@ iot_ida_headless_scan("elfs/<binary>", vendor="<厂商>")
 | 级别 | 判定 | 处理 |
 |------|------|------|
 | **A 级** | 输入直达 sink，无运行时数据/多进程/网络依赖 | 完整动态验证 → 可 CONFIRMED |
-| **B 级** | 需补少量运行时数据（xmldb/NVRAM）才能走完 | **不硬补**，报告静态证据 + 模拟进度 + 建议，交用户 |
+| **B 级** | 需补少量运行时数据（厂商状态库 / NVRAM 节点）才能走完 | **不硬补**，报告静态证据 + 模拟进度 + 建议，交用户 |
 | **C 级** | 需多进程/网络会话/内核接口 | 不验证，报告静态结论 + 建议（真机/系统态），交用户 |
 
 **NEEDS_DYNAMIC 的 notes 必须写明**（禁止笼统标注）：
 ```
 验证级别：B/C
 静态证据链：<source → ... → sink，逐环列出>
-模拟进度：<实际走到哪一步，如"M-SEARCH 脚本已生成，php 查询 xmldb 接口数据失败">
-缺失环境：<如"xmldb /runtime/inf 节点未初始化">
-建议：<如"真机复现 / 系统态模拟 / 补 xmldb 数据">
+模拟进度：<实际走到哪一步，如"脚本已生成，查厂商状态库数据失败">
+缺失环境：<如"厂商状态库某节点未初始化">
+建议：<如"真机复现 / 系统态模拟 / 补状态库数据">
 ```
 
 **hunt 策略**：L2/L3 优先筛 A 级候选；B/C 级给静态 verdict + 级别标注，不投动态验证时间。

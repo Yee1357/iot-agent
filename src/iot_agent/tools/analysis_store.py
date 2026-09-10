@@ -20,13 +20,13 @@ Usage:
     # Create a task
     task_id = store.create_task(
         firmware_id="http://example.com/fw.bin",
-        vendor="dlink", model="dir-815", version="v1",
-        rootfs_path="/data/extracted/dlink/dir-815_v1/rootfs",
+        vendor="acme", model="router-x", version="v1",
+        rootfs_path="/data/extracted/acme/router-x_v1/rootfs",
     )
 
     # Record findings
     finding = VulnerabilityFinding(title="...", severity="HIGH", ...)
-    store.add_finding(task_id, finding, verdict="confirmed", binary_name="cgibin")
+    store.add_finding(task_id, finding, verdict="confirmed", binary_name="httpd")
 
     # Track progress / resume
     store.mark_level(task_id, 2)          # completed Level 2
@@ -34,7 +34,7 @@ Usage:
 
     # Experience memory
     store.record_experience(category="pattern", scenario="...", detail="...")
-    store.search_experiences(vendor="dlink")
+    store.search_experiences(vendor="acme")
 """
 
 from __future__ import annotations

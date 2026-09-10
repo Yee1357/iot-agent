@@ -128,6 +128,31 @@ _FORMAT_STRING_SINKS = {"sprintf", "vsprintf", "snprintf", "fprintf",
                         "printf", "syslog"}
 
 
+def _vendor_sink_entry(name: str, info: dict[str, Any]) -> tuple[str, str, str, float]:
+    """Classification tuple for a vendor sink entry, merged over the generic table.
+
+    A sink that is already generic keeps its generic description: vendor prose
+    describes the vendor's *own* binaries and mislabels an unrelated one (a
+    vendor narrative would otherwise be stamped on every ``system()`` call in
+    any binary). Vendor cwe/severity/confidence still refine the generic entry;
+    a vendor-*new* sink keeps its own text.
+    """
+    base = _SINK_CLASSIFICATION.get(name)
+    if base is not None:
+        return (
+            info.get("cwe", base[0]),
+            base[1],
+            info.get("severity", base[2]),
+            float(info.get("confidence", base[3])),
+        )
+    return (
+        info.get("cwe", _SINK_DEFAULT[0]),
+        info.get("description", _SINK_DEFAULT[1]),
+        info.get("severity", _SINK_DEFAULT[2]),
+        float(info.get("confidence", _SINK_DEFAULT[3])),
+    )
+
+
 def _merge_vendor_knowledge(
     vendor: str = "",
 ) -> tuple[list[str], list[str], dict[str, tuple[str, str, str, float]], set[str]]:
@@ -143,12 +168,7 @@ def _merge_vendor_knowledge(
 
     for name, info in kn["sinks"].items():
         sinks.append(name)
-        classification[name] = (
-            info.get("cwe", _SINK_DEFAULT[0]),
-            info.get("description", ""),
-            info.get("severity", _SINK_DEFAULT[2]),
-            float(info.get("confidence", _SINK_DEFAULT[3])),
-        )
+        classification[name] = _vendor_sink_entry(name, info)
         if info.get("format_string"):
             format_sinks.add(name)
 
@@ -368,15 +388,17 @@ def trace_arg_source(
         rhs = m.group(1).strip()
         trace_lines.append(line.strip())
 
-        # Check if RHS calls a taint source
+        # Check if RHS *calls* a taint source. Must match ``src(`` — a bare
+        # substring test made ``cmd = already_ready`` match the source "read"
+        # and fabricated a taint path the knowledge docs then relied on.
         for src in taint:
-            if src in rhs:
+            src_m = re.search(
+                r'\b' + re.escape(src) + r'\s*\(\s*"?([^")\s]+)', rhs
+            )
+            if src_m:
                 result["source"] = src
                 result["is_tainted"] = True
-                # Try to extract the argument of the taint source
-                src_m = re.search(re.escape(src) + r'\s*\(\s*"?([^")\s]+)', rhs)
-                if src_m:
-                    result["source_detail"] = src_m.group(1)
+                result["source_detail"] = src_m.group(1)
                 break
 
         # If not a direct taint source, check for string concatenation
@@ -392,35 +414,6 @@ def trace_arg_source(
 
     result["trace_lines"] = "\n".join(f"    {l}" for l in trace_lines[:5])
     return result
-
-
-def classify_finding(
-    sink: str,
-    context: str,
-    sink_classification: dict[str, tuple[str, str, str, float]] | None = None,
-    taint_sources: list[str] | None = None,
-) -> tuple[str, str, str, float]:
-    """Classify a finding based on sink type + context.
-
-    More accurate than pure table lookup:
-    - hardcoded arg -> lower confidence
-    - taint source in context -> higher confidence
-
-    Returns (cwe, description, severity, confidence).
-    """
-    classification = sink_classification if sink_classification is not None else _SINK_CLASSIFICATION
-    taint = taint_sources if taint_sources is not None else TAINT_SOURCES
-    cwe, desc, severity, confidence = classification.get(sink, _SINK_DEFAULT)
-
-    # Boost if taint source visible in context
-    for src in taint:
-        if src in context:
-            confidence = min(confidence + 0.2, 1.0)
-            if confidence > 0.7:
-                severity = "CRITICAL"
-            break
-
-    return cwe, desc, severity, confidence
 
 
 # ---------------------------------------------------------------------------
@@ -552,11 +545,12 @@ class IDAHeadlessScanner:
                 format_string_sinks=self.format_string_sinks,
             )
 
-            # Classify
-            cwe, desc, severity, confidence = classify_finding(
-                sink, context,
-                sink_classification=self.sink_classification,
-                taint_sources=self.taint_sources,
+            # Classify — plain sink-type table lookup. No confidence/severity
+            # escalation from substring matches: a "read"/"gets" appearing
+            # anywhere in the snippet is not evidence, yet it used to decide
+            # both the CRITICAL tag and the AI's reading order.
+            cwe, desc, severity, confidence = self.sink_classification.get(
+                sink, _SINK_DEFAULT
             )
 
             # Build source-sink path description
@@ -587,3 +581,39 @@ class IDAHeadlessScanner:
                      total=len(findings),
                      high_risk=sum(1 for f in findings if f.confidence >= 0.5))
         return findings
+
+
+def _demo() -> None:
+    """Self-check for the regex helpers. Run: python -m iot_agent.tools.ida_scanner"""
+    fmt = _FORMAT_STRING_SINKS
+    # Hardcoded args are excluded...
+    assert is_hardcoded_arg('system("reboot");', "system")
+    assert is_hardcoded_arg('sprintf(buf, "Content-Type: text/html");', "sprintf", fmt)
+    # ...but a placeholdered format (or a variable arg) must be kept.
+    assert not is_hardcoded_arg('sprintf(buf, "svc %s", x);', "sprintf", fmt)
+    assert not is_hardcoded_arg("system(cmd);", "system")
+    # Taint source only counts as a *call*: "read" must not match "already_ready".
+    t = trace_arg_source(
+        "cmd = already_ready;\nsystem(cmd);", "system",
+        taint_sources=["read"], format_string_sinks=fmt,
+    )
+    assert not t["is_tainted"], t
+    t = trace_arg_source(
+        'cmd = getenv("QUERY_STRING");\nsystem(cmd);', "system",
+        taint_sources=["getenv"], format_string_sinks=fmt,
+    )
+    assert t["is_tainted"] and t["source"] == "getenv", t
+    assert t["source_detail"] == "QUERY_STRING", t
+    # Vendor sink entries must not stamp vendor prose onto a generic sink name.
+    _, desc, sev, conf = _vendor_sink_entry("system", {
+        "cwe": "CWE-78", "description": "vendor narrative...",
+        "severity": "CRITICAL", "confidence": 0.85})
+    assert desc == "command injection", desc   # generic description kept
+    assert (sev, conf) == ("CRITICAL", 0.85)   # vendor calibration still applies
+    _, vdesc, _, _ = _vendor_sink_entry("vendor_wrapper_fn", {"description": "wrapper sink"})
+    assert vdesc == "wrapper sink"             # vendor-new sink keeps its own text
+    print("ida_scanner self-check OK")
+
+
+if __name__ == "__main__":
+    _demo()

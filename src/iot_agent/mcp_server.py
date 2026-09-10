@@ -502,7 +502,7 @@ def iot_ida_headless_scan(binary_path: str, vendor: str = "") -> list[dict[str, 
 
     This is only available on the machine that has IDA Pro / idalib installed.
     If IDA is already running, prefer the separate ``ida-pro-mcp`` server.
-    Pass ``vendor`` (e.g. "dlink") to merge vendor-specific sinks/taint
+    Pass ``vendor`` (e.g. "acme") to merge vendor-specific sinks/taint
     sources from ``knowledge/<vendor>.json``.
     """
     from iot_agent.tools.ida_mcp import IDAHeadlessClient
