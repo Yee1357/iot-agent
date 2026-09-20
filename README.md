@@ -31,19 +31,20 @@
 
 ## 环境要求
 
-- **Windows 本机**：Python 3.12（conda）、Claude Code，可选 IDA Pro 9.x
+- **Windows 本机**：uv（Python 版本由 `.python-version` 指定，uv 自动拉取）、Claude Code，可选 IDA Pro 9.x
 - **Linux VM**：`binwalk radare2 squashfs-tools qemu-user-static`，SSH 可达
 
 ## 安装
 
 ```bash
-conda create -n iot-agent python=3.12 -y
-conda activate iot-agent
-pip install -e .
+uv sync                # 建 .venv（Python 3.12）并装依赖
+uv run pytest          # 跑测试
 cp .env.example .env   # 填 VM SSH 与 IDA 路径
 ```
 
-- `.mcp.json` 已注册 `iot-agent` server（经 `conda run -n iot-agent` 启动），项目目录启动 `claude` 即自动拉起，`iot_*` 工具直接可用
+- 跑任何命令用 `uv run <cmd>`（如测试 `uv run pytest`）
+- IDA headless（L3）额外需要 idalib：先装 IDA Pro 并跑它自带的 `py-activate-idalib.py`，再 `uv pip install -e <IDA>/idalib/python`
+- `.mcp.json` 已注册 `iot-agent` server（经 `uv run` 启动），项目目录启动 `claude` 即自动拉起，`iot_*` 工具直接可用
 - 大部分操作依赖 VM；仅对已有 ELF 跑 IDA headless 扫描时可不连 VM
 
 ## 使用
