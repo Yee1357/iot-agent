@@ -43,7 +43,13 @@ cp .env.example .env   # 填 VM SSH 与 IDA 路径
 ```
 
 - 跑任何命令用 `uv run <cmd>`（如测试 `uv run pytest`）
-- IDA headless（L3）额外需要 idalib：先装 IDA Pro 并跑它自带的 `py-activate-idalib.py`，再 `uv pip install -e <IDA>/idalib/python`
+- IDA headless（L3）额外需要 idalib：装 IDA Pro（≥9.0）并跑它自带的 `py-activate-idalib.py`，再让 venv 认到 IDA 的 Python 目录：
+
+  ```bash
+  uv run python -c "import sysconfig,pathlib;pathlib.Path(sysconfig.get_paths()['purelib'],'ida-idalib.pth').write_text('<IDA>/idalib/python')"
+  ```
+
+  （走 `.pth` 而非 `pip install`，`uv sync` 不会把它删掉）
 - `.mcp.json` 已注册 `iot-agent` server（经 `uv run` 启动），项目目录启动 `claude` 即自动拉起，`iot_*` 工具直接可用
 - 大部分操作依赖 VM；仅对已有 ELF 跑 IDA headless 扫描时可不连 VM
 
