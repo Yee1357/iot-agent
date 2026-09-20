@@ -200,20 +200,13 @@ verdict 判定推演示例见 `knowledge/vuln-patterns.md` §判定推演示例�
 
 ### 输出报告
 
-```
-## 漏洞分析报告
+单洞报告套 `reports/_TEMPLATE.md`，落盘为 `reports/<YYYY-MM-DD>-<vendor>-vuln-<n>-<binary>-<type>.md`。
+
+多洞批量任务先在对话里给汇总表：
 
 | # | 漏洞 | 严重度 | Source → Sink | 结论 |
 |---|------|--------|---------------|------|
 | 1 | xxx   | HIGH   | getenv("UID") → sprintf → system | CONFIRMED |
-
-### 漏洞 #1 详情
-- 位置：<binary> @ <func> @ <addr>
-- 数据流：...
-- 攻击向量：...
-- PoC：...
-- 修复建议：...
-```
 
 ---
 

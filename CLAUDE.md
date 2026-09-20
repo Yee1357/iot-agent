@@ -46,9 +46,14 @@ verdict 全程只有四种：CONFIRMED / DISPROVED / WEAKENED / NEEDS_DYNAMIC（
 
 ## 硬约束（任何 skill 都不覆盖）
 
-1. **止损硬上限**：同一动态验证方案 2 次尝试；L3 单候选 1 次完整反编译 + 数据流追踪；环境修复 1 轮排查；单 hunt 默认 2 小时。到点即升级。
+1. **止损硬上限**：同一动态验证方案 2 次尝试；L3 单候选 1 次完整反编译 + 数据流追踪；环境修复 1 轮排查；单 hunt 默认 2 小时。到点即升级。**次数用 `iot_analysis_note_attempt(task_id, scheme, candidate)` 落库计数**——它持久化，上下文压缩后仍然准确（靠记性数必然失守）；返回 `exhausted=true` 即为触发上限，此时换方案或升级，**不要再试同一方案**。
 2. **L3 必须问用户**（用 `ask_user` 工具，提问前先 `iot_analysis_mark_level` 落库）：环境修复失败、需要外部资源、范围/目标冲突、同一失败连续 ≥3 次、hunt 超时、高危确认后"继续挖 vs 出报告"的方向选择。
-3. **续跑点必须可恢复**：随时 `iot_analysis_mark_level(task_id, level)` 记录进度，中断前 findings 已落库。断点续跑：`iot_analysis_list_tasks(status="running")` → `iot_analysis_resume_task(task_id)`。
-4. **经验回写强制（每洞一次）**：候选动态复现成功或明确受阻后，先把教训 `iot_experience_record` 入库（先 grep/加载查重，语义重叠 bump 原条目、scenario 唯一 upsert），环境坑长文增量更新 `knowledge/emulation-experiences.md`（同上查重纪律），然后才进下一个候选。
+3. **续跑点必须可恢复**：随时 `iot_analysis_mark_level(task_id, level)` 记录进度，中断前 findings 已落库。**每个"考虑过的入口"都要 `iot_analysis_add_candidate` 留痕**——包括 L2 就被否掉的，`status="rejected"` 且必须写 `reason`。没有 candidate 轨迹，"每个候选逐一给出结论"无法审计，续跑也不知道什么已被排除。断点续跑：`iot_analysis_list_tasks(status="running")` → `iot_analysis_resume_task(task_id)`。
+4. **经验回写强制（每洞一次；一条教训只写一处）**：候选动态复现成功或明确受阻后，先把教训落库，然后才进下一个候选。**禁止在 md 与 experiences 表里把同一条写两遍**，按内容性质选一处：
+   - **跨厂商可复用的机制/规则** → `knowledge/vuln-patterns.md`（收录边界见该文件顶部）
+   - **环境坑 / 定位取证技巧 / 厂商实例索引** → `knowledge/emulation-experiences.md` 对应章节
+   - **实时教训** → `iot_experience_record` 入库，长文侧只留一行指向它
+
+   查重与覆盖：`iot_experience_load(vendor=..., arch=..., full=True)` 读摘要；语义重叠则 bump 或按 scenario upsert。**覆盖前必须 `iot_experience_get(id)` 读全文**——load 的摘要截断在 300 字符，照摘要覆盖会静默丢掉看不见的内容。
 5. **分析结束清理**：ELF 分析完 `iot_ida_cleanup(<elf_dir>)`；chroot 验证完 `iot_emulation_chroot_cleanup(workdir, remove_workdir=True)`。
 6. **报告/经验质量**：只沉淀可复用知识，禁机器特定路径（rootfs 写 `/data/extracted/<brand>/<model>_<ver>/rootfs`，本地 ELF 写 `elfs/<binary>`，VM 日志写 `/tmp/xxx.log`）；一次性信息不入库。

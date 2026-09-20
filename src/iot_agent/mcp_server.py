@@ -303,14 +303,30 @@ def iot_analysis_update_finding(
     finding_id: int,
     verdict: str = "",
     notes: str = "",
+    binary_name: str = "",
+    func_name: str = "",
+    address: str = "",
+    source_sink: str = "",
+    severity: str = "",
+    cwe_id: str = "",
 ) -> None:
-    """Update a finding's verdict and/or notes (e.g. after L4 verification)."""
+    """Update a finding's verdict/notes or correct its identifying fields.
+
+    Only the arguments you pass are written. The identity fields
+    (``binary_name`` / ``func_name`` / ``address`` / ``source_sink``) are
+    correctable here because they are what ``iot_analysis_insights`` and any
+    cross-model comparison key on -- a finding whose ``address`` was left empty
+    silently drops out of those queries.
+    """
     store = AnalysisStore()
     fields: dict[str, Any] = {}
-    if verdict:
-        fields["verdict"] = verdict
-    if notes:
-        fields["notes"] = notes
+    for key, value in (
+        ("verdict", verdict), ("notes", notes), ("binary_name", binary_name),
+        ("func_name", func_name), ("address", address),
+        ("source_sink", source_sink), ("severity", severity), ("cwe_id", cwe_id),
+    ):
+        if value:
+            fields[key] = value
     if fields:
         store.update_finding(finding_id, **fields)
 
@@ -358,10 +374,98 @@ def iot_analysis_get_findings(
 def iot_analysis_resume_task(task_id: int) -> dict[str, Any]:
     """Return a task plus its still-pending candidates for resuming a hunt.
 
-    Candidates whose verdict is CONFIRMED/DISPROVED/WEAKENED are excluded --
-    the agent can skip straight to the pending ones.
+    Findings whose verdict is CONFIRMED/DISPROVED/WEAKENED are excluded -- the
+    agent can skip straight to the pending ones. ``candidates`` carries the full
+    considered-entry-point trail (including ones rejected before becoming a
+    finding) so a resumed session knows what was already ruled out.
     """
     return AnalysisStore().resume_task(task_id)
+
+
+@app.tool()
+def iot_analysis_add_candidate(
+    task_id: int,
+    binary_name: str,
+    func_name: str = "",
+    param: str = "",
+    sink_kind: str = "",
+    status: str = "new",
+    reason: str = "",
+    evidence: str = "",
+) -> int:
+    """Record an entry point that was CONSIDERED (L1/L2), not only ones found.
+
+    This is what makes coverage auditable: a candidate dropped at L2 otherwise
+    leaves no trace, so neither the "每个候选逐一给出结论" rule nor a resumed
+    session can tell what was already ruled out.
+
+    ``status``: ``new`` | ``rejected`` | ``promoted``. For ``rejected``, always
+    fill ``reason`` (no sink / constant arg / unreachable branch / ...).
+    Idempotent on (task_id, binary_name, func_name, param).
+    """
+    return AnalysisStore().add_candidate(
+        task_id, binary_name, func_name=func_name, param=param,
+        sink_kind=sink_kind, status=status, reason=reason, evidence=evidence,
+    )
+
+
+@app.tool()
+def iot_analysis_list_candidates(
+    task_id: int,
+    status: str = "",
+) -> list[dict[str, Any]]:
+    """List the candidate trail for a task, optionally filtered by status."""
+    return AnalysisStore().list_candidates(task_id, status=status)
+
+
+@app.tool()
+def iot_analysis_update_candidate(
+    candidate_id: int,
+    status: str = "",
+    reason: str = "",
+    evidence: str = "",
+    finding_id: int = 0,
+) -> None:
+    """Update a candidate's status/reason/evidence after triage.
+
+    Pass ``finding_id`` to link the candidate to the finding it turned into
+    (also flips ``status`` to ``promoted``).
+    """
+    store = AnalysisStore()
+    if finding_id:
+        store.mark_candidate_promoted(candidate_id, finding_id)
+    fields: dict[str, Any] = {}
+    if status:
+        fields["status"] = status
+    if reason:
+        fields["reason"] = reason
+    if evidence:
+        fields["evidence"] = evidence
+    if fields:
+        store.update_candidate(candidate_id, **fields)
+
+
+@app.tool()
+def iot_analysis_note_attempt(
+    task_id: int,
+    scheme: str,
+    candidate: str = "",
+    limit: int = 2,
+    success: bool = False,
+) -> dict[str, Any]:
+    """Count an attempt at a (scheme, candidate) pair against the stop-loss limit.
+
+    Call this around every attempt at a scheme; the count is persisted so it
+    survives context compaction -- which is precisely when the agent loses
+    track and starts looping. ``success=True`` resets the counter.
+
+    Read ``exhausted``: when true, the hard constraint has been hit -- switch
+    scheme or stop and escalate to the user (hard constraint 2), do not retry
+    the same scheme again. ``guidance`` carries the instruction in words.
+    """
+    return AnalysisStore().note_attempt(
+        task_id, scheme, candidate=candidate, limit=limit, success=success
+    )
 
 
 @app.tool()
@@ -414,15 +518,38 @@ def iot_experience_load(
     vendor: str = "",
     arch: str = "",
     limit: int = 20,
+    full: bool = False,
 ) -> list[dict[str, Any]]:
     """Load reusable lessons for the current hunt context.
 
     Call this at hunt start with the target vendor/arch to get a compact
     digest (details truncated to 300 chars) of what worked and what did not.
+    Cross-vendor / arch-agnostic lessons are included alongside the vendor's
+    own; each row carries ``score`` = success_count - fail_count (a negative
+    score means the pattern has historically NOT paid off for this vendor).
+
+    ``full=True`` returns untruncated details -- use it before overwriting an
+    entry, otherwise you will drop whatever the digest hid.
     """
     return AnalysisStore().search_experiences(
-        category=category, vendor=vendor, arch=arch, limit=limit
+        category=category, vendor=vendor, arch=arch, limit=limit,
+        summary_only=not full,
     )
+
+
+@app.tool()
+def iot_experience_get(exp_id: int) -> dict[str, Any]:
+    """Read one experience entry in full (no truncation)."""
+    return AnalysisStore().get_experience(exp_id) or {}
+
+
+@app.tool()
+def iot_experience_delete(exp_id: int) -> bool:
+    """Delete an experience entry (e.g. ingest junk keyed off a report heading).
+
+    Returns True if a row was removed.
+    """
+    return AnalysisStore().delete_experience(exp_id)
 
 
 @app.tool()
@@ -494,6 +621,37 @@ def iot_knowledge_vendors() -> list[dict[str, Any]]:
     """
     from iot_agent.tools.ida_scanner import list_vendor_knowledge
     return list_vendor_knowledge()
+
+
+@app.tool()
+def iot_knowledge_promote(
+    vendor: str,
+    sink_name: str = "",
+    taint_source: str = "",
+    cwe: str = "",
+    description: str = "",
+    severity: str = "",
+    confidence: float | None = None,
+    format_string: bool | None = None,
+) -> dict[str, Any]:
+    """Write a discovered sink / taint source into knowledge/<vendor>.json.
+
+    The write-back half of the vendor-knowledge loop: when a hunt finds a
+    vendor wrapper the generic table does not know, record it here so the next
+    ``iot_ida_headless_scan`` flags it. Non-destructive merge; omitted fields
+    keep their stored value.
+
+    Pass ``sink_name`` for a dangerous *function* (e.g. a wrapper that ends in
+    ``system``), or ``taint_source`` for a request-parameter getter. The
+    returned ``warning`` tells you when the sink is already generic and the
+    description you passed will be ignored.
+    """
+    from iot_agent.tools.ida_scanner import promote_vendor_knowledge
+    return promote_vendor_knowledge(
+        vendor=vendor, sink_name=sink_name, taint_source=taint_source,
+        cwe=cwe, description=description, severity=severity,
+        confidence=confidence, format_string=format_string,
+    )
 
 
 @app.tool()

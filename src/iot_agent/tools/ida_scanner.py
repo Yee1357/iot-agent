@@ -119,6 +119,101 @@ def list_vendor_knowledge() -> list[dict[str, Any]]:
     return out
 
 
+def promote_vendor_knowledge(
+    vendor: str,
+    sink_name: str = "",
+    taint_source: str = "",
+    cwe: str = "",
+    description: str = "",
+    severity: str = "",
+    confidence: float | None = None,
+    format_string: bool | None = None,
+) -> dict[str, Any]:
+    """Write a discovered sink / taint source back into ``knowledge/<vendor>.json``.
+
+    The write-back half of the vendor-knowledge loop: a hunt that finds a
+    vendor wrapper the generic table does not know records it here, so the next
+    ``iot_ida_headless_scan`` flags it. Without this the scanner's knowledge
+    never improves from hunts.
+
+    Merge is non-destructive -- omitted fields keep their stored value.
+
+    .. warning::
+       Promoting a sink **already in the generic table** (``system``, ``popen``,
+       ``strcpy`` ...) is mostly a no-op: ``_vendor_sink_entry`` keeps the
+       generic description and honours only cwe/severity/confidence, so the
+       ``description`` you pass is **silently ignored** (this is how
+       ``dlink.json`` accumulated a long DNS-320 ``system`` narrative that the
+       scanner never reads). Use this for vendor-*new* wrappers; record
+       confirmed *call forms* in the report / experiences instead. The returned
+       ``warning`` field flags this case.
+    """
+    if not vendor:
+        raise ValueError("vendor is required")
+    if not sink_name and not taint_source:
+        raise ValueError("pass sink_name and/or taint_source")
+
+    path = _KNOWLEDGE_DIR / f"{vendor.strip().lower()}.json"
+    data: dict[str, Any] = {}
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            raise ValueError(f"unreadable vendor knowledge file: {path}")
+
+    data.setdefault("vendor", vendor)
+    data.setdefault("description", "")
+    data.setdefault("sinks", {})
+    data.setdefault("taint_sources", [])
+
+    warning = ""
+    if sink_name:
+        entry = dict(data["sinks"].get(sink_name, {}))
+        if cwe:
+            entry["cwe"] = cwe
+        if description:
+            entry["description"] = description
+        if severity:
+            entry["severity"] = severity
+        if confidence is not None:
+            entry["confidence"] = float(confidence)
+        if format_string is not None:
+            entry["format_string"] = bool(format_string)
+        entry.setdefault("cwe", _SINK_DEFAULT[0])
+        entry.setdefault("description", _SINK_DEFAULT[1])
+        entry.setdefault("severity", _SINK_DEFAULT[2])
+        entry.setdefault("confidence", float(_SINK_DEFAULT[3]))
+        entry.setdefault("format_string", False)
+        data["sinks"][sink_name] = entry
+        if sink_name in _SINK_CLASSIFICATION:
+            warning = (
+                f"{sink_name!r} is already in the generic sink table -- its "
+                "description from this file is ignored by the scanner (only "
+                "cwe/severity/confidence are honoured)"
+            )
+            logger.warning("promoting generic sink", vendor=vendor, sink=sink_name)
+
+    if taint_source and taint_source not in data["taint_sources"]:
+        data["taint_sources"].append(taint_source)
+
+    _KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    logger.info("vendor knowledge promoted",
+                vendor=vendor, sink=sink_name or None,
+                taint_source=taint_source or None, path=str(path))
+    return {
+        "vendor": data["vendor"],
+        "file": path.name,
+        "sink": sink_name or None,
+        "taint_source": taint_source or None,
+        "sinks_total": len(data["sinks"]),
+        "taint_sources_total": len(data["taint_sources"]),
+        "warning": warning,
+    }
+
+
 # Format-string sinks: the dangerous arg is NOT the format string (1st arg),
 # but the variadic args that get interpolated.  A format string containing
 # %s / %n / %x means external data flows in → must NOT be treated as safe.

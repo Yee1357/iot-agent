@@ -53,6 +53,21 @@ logger = structlog.get_logger(__name__)
 #: canonical verdicts (always stored lowercase; input case is normalized)
 _VERDICTS = ("confirmed", "disproved", "weakened", "needs_dynamic", "pending")
 
+#: candidate lifecycle. A candidate is an *entry point considered*, not a
+#: finding: ``rejected`` records a candidate ruled out before it was worth a
+#: decompile, which is what makes L2 coverage auditable.
+_CANDIDATE_STATUSES = ("new", "rejected", "promoted")
+
+#: Headings that appear in every report and carry no reusable lesson.
+#: ``ingest_report`` keys scenarios off the heading verbatim, so without this
+#: a report's boilerplate sections land in the experience memory as "lessons"
+#: named ``[report] 固件信息`` / ``[report] PoC`` -- noise in every later load.
+_REPORT_BOILERPLATE = (
+    "固件信息", "固件版本", "静态证据链", "动态验证", "poc",
+    "修复建议", "影响范围", "漏洞描述", "漏洞概述", "验证结论",
+    "攻击链", "攻击面", "任务", "状态", "报告日期", "source → sink",
+)
+
 #: project root (``src/iot_agent/tools/...`` -> repo root) -- DB paths must
 #: not depend on the process CWD, the MCP server may start from anywhere.
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -131,6 +146,47 @@ class AnalysisStore:
                 ON findings(task_id);
             CREATE INDEX IF NOT EXISTS idx_finding_verdict
                 ON findings(verdict);
+
+            -- Candidate trail: every entry point the agent CONSIDERED, including
+            -- the ones rejected before they ever became a finding. Without this,
+            -- "每个候选逐一给出结论" is unenforceable -- a candidate dropped at L2
+            -- leaves no trace, so coverage cannot be audited and a resumed
+            -- session cannot tell what was already ruled out.
+            CREATE TABLE IF NOT EXISTS candidates (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id         INTEGER NOT NULL REFERENCES analysis_tasks(id),
+                binary_name     TEXT NOT NULL DEFAULT '',
+                func_name       TEXT NOT NULL DEFAULT '',
+                param           TEXT NOT NULL DEFAULT '',
+                sink_kind       TEXT NOT NULL DEFAULT '',
+                status          TEXT NOT NULL DEFAULT 'new',
+                reason          TEXT NOT NULL DEFAULT '',
+                evidence        TEXT NOT NULL DEFAULT '',
+                finding_id      INTEGER,
+                created_at      REAL NOT NULL,
+                updated_at      REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_candidate_task
+                ON candidates(task_id, status);
+
+            -- Stop-loss counters. Hard constraints ("同一动态验证方案 2 次尝试",
+            -- "同一失败连续 3 次即停") are otherwise pure memory: a context
+            -- compaction is exactly when the agent loses count and starts
+            -- looping. Persisting the count is what makes them enforceable.
+            CREATE TABLE IF NOT EXISTS attempts (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id         INTEGER NOT NULL REFERENCES analysis_tasks(id),
+                scheme          TEXT NOT NULL,
+                candidate       TEXT NOT NULL DEFAULT '',
+                count           INTEGER NOT NULL DEFAULT 0,
+                created_at      REAL NOT NULL,
+                updated_at      REAL NOT NULL,
+                UNIQUE(task_id, scheme, candidate)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_attempt_task
+                ON attempts(task_id);
 
             CREATE TABLE IF NOT EXISTS experiences (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -425,12 +481,180 @@ class AnalysisStore:
     # Resume support (candidate-level checkpointing)
     # -------------------------------------------------------------------
 
+    # -------------------------------------------------------------------
+    # Candidate trail (coverage audit: what was considered, not just found)
+    # -------------------------------------------------------------------
+
+    def add_candidate(
+        self,
+        task_id: int,
+        binary_name: str,
+        func_name: str = "",
+        param: str = "",
+        sink_kind: str = "",
+        status: str = "new",
+        reason: str = "",
+        evidence: str = "",
+    ) -> int:
+        """Record an entry point that was considered. Returns candidate id.
+
+        Idempotent on ``(task_id, binary_name, func_name, param)``: re-triaging
+        the same entry point refreshes the row instead of duplicating it.
+        """
+        status = (status or "new").strip().lower()
+        if status not in _CANDIDATE_STATUSES:
+            raise ValueError(
+                f"bad candidate status {status!r}, expected one of {_CANDIDATE_STATUSES}"
+            )
+        conn = self._get_conn()
+        now = time.time()
+        row = conn.execute(
+            "SELECT id FROM candidates WHERE task_id = ? AND binary_name = ? "
+            "AND func_name = ? AND param = ?",
+            (task_id, binary_name, func_name, param),
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE candidates SET sink_kind = ?, status = ?, reason = ?, "
+                "evidence = ?, updated_at = ? WHERE id = ?",
+                (sink_kind, status, reason, evidence, now, row["id"]),
+            )
+            conn.commit()
+            return row["id"]
+        cur = conn.execute("""
+            INSERT INTO candidates
+                (task_id, binary_name, func_name, param, sink_kind,
+                 status, reason, evidence, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (task_id, binary_name, func_name, param, sink_kind,
+              status, reason, evidence, now, now))
+        conn.commit()
+        return cur.lastrowid
+
+    def list_candidates(self, task_id: int, status: str = "") -> list[dict]:
+        """Candidates for a task, optionally filtered by status."""
+        conn = self._get_conn()
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM candidates WHERE task_id = ? AND status = ? ORDER BY id",
+                (task_id, status.strip().lower()),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM candidates WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_candidate(self, candidate_id: int, **fields: object) -> None:
+        """Update candidate fields (typically ``status`` / ``reason``)."""
+        if not fields:
+            return
+        if "status" in fields:
+            s = str(fields["status"]).strip().lower()
+            if s not in _CANDIDATE_STATUSES:
+                raise ValueError(
+                    f"bad candidate status {s!r}, expected one of {_CANDIDATE_STATUSES}"
+                )
+            fields["status"] = s
+        conn = self._get_conn()
+        fields["updated_at"] = time.time()
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        conn.execute(
+            f"UPDATE candidates SET {cols} WHERE id = ?",
+            (*fields.values(), candidate_id),
+        )
+        conn.commit()
+
+    def mark_candidate_promoted(self, candidate_id: int, finding_id: int) -> None:
+        """Link a candidate to the finding it turned into."""
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE candidates SET status = 'promoted', finding_id = ?, updated_at = ? "
+            "WHERE id = ?", (finding_id, time.time(), candidate_id),
+        )
+        conn.commit()
+
+    # -------------------------------------------------------------------
+    # Stop-loss counters (survive context compaction; see hard constraints)
+    # -------------------------------------------------------------------
+
+    def note_attempt(
+        self,
+        task_id: int,
+        scheme: str,
+        candidate: str = "",
+        limit: int = 2,
+        success: bool = False,
+    ) -> dict:
+        """Count an attempt at a (scheme, candidate) pair; report when to stop.
+
+        Call before/after each attempt. ``success=True`` resets the counter to
+        0 (the scheme worked -- the budget is fresh again). Returns
+        ``{"count", "limit", "exhausted", "guidance"}`` where ``exhausted``
+        means the hard stop-loss limit is reached and you must switch scheme /
+        stop and escalate to the user rather than retrying.
+        """
+        conn = self._get_conn()
+        now = time.time()
+        row = conn.execute(
+            "SELECT * FROM attempts WHERE task_id = ? AND scheme = ? AND candidate = ?",
+            (task_id, scheme, candidate),
+        ).fetchone()
+        if success:
+            if row:
+                conn.execute(
+                    "UPDATE attempts SET count = 0, updated_at = ? WHERE id = ?",
+                    (now, row["id"]),
+                )
+                conn.commit()
+            count = 0
+        elif row:
+            count = row["count"] + 1
+            conn.execute(
+                "UPDATE attempts SET count = ?, updated_at = ? WHERE id = ?",
+                (count, now, row["id"]),
+            )
+            conn.commit()
+        else:
+            count = 1
+            conn.execute(
+                "INSERT INTO attempts (task_id, scheme, candidate, count, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (task_id, scheme, candidate, count, now, now),
+            )
+            conn.commit()
+
+        exhausted = count >= limit
+        return {
+            "count": count,
+            "limit": limit,
+            "exhausted": exhausted,
+            "guidance": (
+                f"止损：同一方案已尝试 {count} 次(上限 {limit})。换方案，或按硬约束 2 "
+                "停下来向用户升级——不要继续重试同一方案。"
+                if exhausted and not success else ""
+            ),
+        }
+
+    def list_attempts(self, task_id: int) -> list[dict]:
+        """All stop-loss counters for a task (newest activity first)."""
+        rows = self._get_conn().execute(
+            "SELECT * FROM attempts WHERE task_id = ? ORDER BY updated_at DESC",
+            (task_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def resume_task(self, task_id: int) -> dict:
         """Return everything needed to resume an interrupted analysis task.
 
-        ``pending`` contains findings whose verdict still needs work:
-        ``pending`` / ``needs_dynamic`` (already-judged CONFIRMED / DISPROVED
-        / WEAKENED candidates are excluded so the agent skips them).
+        ``pending_candidates`` = findings whose verdict still needs work
+        (``pending`` / ``needs_dynamic``; already-judged CONFIRMED / DISPROVED /
+        WEAKENED are excluded so the agent skips them).
+
+        ``candidates`` = the full considered-entry-point trail, including ones
+        rejected before becoming a finding -- so a resumed session can tell what
+        was already ruled out and coverage can be audited.
         """
         task = self.get_task(task_id)
         if not task:
@@ -440,10 +664,16 @@ class AnalysisStore:
             f for f in findings
             if f["verdict"] in ("pending", "", "needs_dynamic")
         ]
+        candidates = self.list_candidates(task_id)
         return {
             "task": task,
             "total_findings": len(findings),
             "pending_candidates": pending,
+            "candidates": candidates,
+            "candidates_rejected": [
+                c for c in candidates if c["status"] == "rejected"
+            ],
+            "attempts": self.list_attempts(task_id),
         }
 
     # -------------------------------------------------------------------
@@ -493,6 +723,18 @@ class AnalysisStore:
         logger.info("experience recorded", exp_id=cur.lastrowid, category=category)
         return cur.lastrowid
 
+    def get_experience(self, exp_id: int) -> dict | None:
+        """Read one experience in full (no truncation).
+
+        Needed before a read-modify-write: ``search_experiences`` truncates
+        ``detail``, so overwriting an entry from a digest alone silently drops
+        whatever you could not see.
+        """
+        row = self._get_conn().execute(
+            "SELECT * FROM experiences WHERE id = ?", (exp_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
     def search_experiences(
         self,
         category: str = "",
@@ -500,11 +742,17 @@ class AnalysisStore:
         arch: str = "",
         limit: int = 20,
         summary_only: bool = True,
+        include_general: bool = True,
     ) -> list[dict]:
         """Query reusable lessons, optionally filtered by category/vendor/arch.
 
         ``summary_only`` truncates ``detail`` so the agent can load a digest
         without blowing the context window. Order: most-successful first.
+
+        ``include_general`` (default) also returns the cross-vendor /
+        arch-agnostic entries (``vendor == ''`` / ``arch == ''``) when a
+        filter is given -- those lessons apply to every target, and matching
+        vendor exactly used to hide them from a vendor-scoped load.
         """
         conn = self._get_conn()
         conditions: list[str] = []
@@ -513,10 +761,15 @@ class AnalysisStore:
             conditions.append("category = ?")
             params.append(category)
         if vendor:
-            conditions.append("LOWER(vendor) = LOWER(?)")
+            conditions.append(
+                "(LOWER(vendor) = LOWER(?) OR vendor = '')" if include_general
+                else "LOWER(vendor) = LOWER(?)"
+            )
             params.append(vendor)
         if arch:
-            conditions.append("arch = ?")
+            conditions.append(
+                "(arch = ? OR arch = '')" if include_general else "arch = ?"
+            )
             params.append(arch)
         where = " AND ".join(conditions) if conditions else "1=1"
         query = (
@@ -530,8 +783,23 @@ class AnalysisStore:
             d = dict(r)
             if summary_only:
                 d["detail"] = d["detail"][:300]
+            d["score"] = d["success_count"] - d["fail_count"]
             out.append(d)
         return out
+
+    def delete_experience(self, exp_id: int) -> bool:
+        """Remove an experience entry. Returns True if a row was deleted.
+
+        Needed because ``ingest_report`` can create entries keyed off report
+        boilerplate -- junk that would otherwise sit in every later
+        ``search_experiences`` forever, with no way to remove it.
+        """
+        conn = self._get_conn()
+        cur = conn.execute("DELETE FROM experiences WHERE id = ?", (exp_id,))
+        conn.commit()
+        if cur.rowcount:
+            logger.info("experience deleted", exp_id=exp_id)
+        return bool(cur.rowcount)
 
     def bump_experience(self, exp_id: int, success: bool = True) -> None:
         """Mark an experience as having worked (or not) again."""
@@ -575,6 +843,19 @@ class AnalysisStore:
         document title). Each section becomes one experience entry:
         scenario=heading, detail=body (trimmed, max 1200 chars).
         Returns the list of experience ids (0 recorded when nothing parseable).
+
+        Boilerplate headings (固件信息 / 静态证据链 / PoC / 修复建议 ... -- see
+        ``_REPORT_BOILERPLATE``) are skipped: they recur in every report and
+        carry no reusable lesson.
+
+        .. warning::
+           ``scenario`` is the **verbatim heading**, which does not match the
+           free-form scenarios written by ``record_experience`` during a hunt
+           (e.g. heading ``2.17 [verification] CGI 的 ... 取证法`` vs scenario
+           ``CGI 的 ...：后台运行+轮询端口+nc 取证``). Re-ingesting an already
+           recorded document therefore **adds duplicate rows instead of
+           refreshing them**. Use this for bulk digestion of historical
+           reports, not as a sync step for a live knowledge doc.
         """
         p = Path(report_path)
         if not p.is_file():
@@ -602,7 +883,15 @@ class AnalysisStore:
             sections.append((current_title, current_body))
 
         ids: list[int] = []
+        skipped = 0
         for title, body in sections:
+            # ponytail: boilerplate sections (固件信息 / PoC / 修复建议 ...) are
+            # not lessons; keying a row off them is how the memory got filled
+            # with heading-named noise. A reusable lesson is written as one
+            # (see hard constraint 4), not scraped out of a report's skeleton.
+            if any(k in title.lower() for k in _REPORT_BOILERPLATE):
+                skipped += 1
+                continue
             detail = "\n".join(body).strip()
             if not detail:
                 detail = "(no detail in report section)"
@@ -615,7 +904,7 @@ class AnalysisStore:
                 arch=arch,
             ))
         logger.info("report ingested", path=report_path,
-                    sections=len(sections), recorded=len(ids))
+                    sections=len(sections), recorded=len(ids), skipped=skipped)
         return ids
 
     def findings_insights(self, vendor: str = "") -> dict:
